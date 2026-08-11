@@ -6,7 +6,7 @@ export const HISTORY_LEVELS = HISTORY_LEVEL_INTERVALS.length;
 export const BOOK_LEVELS = 25;
 export const SNAPSHOT_KIND = 1;
 export const UPDATE_KIND = 2;
-export const UPDATE_HEADER_BYTES = 56;
+export const UPDATE_HEADER_BYTES = 64;
 export const UPDATE_FRAME_BYTES = UPDATE_HEADER_BYTES + DEPTH_ROWS * 4 + BOOK_LEVELS * 3 * 4;
 export const COMMIT_HISTORY = 1;
 
@@ -62,10 +62,12 @@ export interface UpdateFrame {
   sessionVolume: number;
   cumulativeDelta: number;
   imbalance: number;
-  tradePrice: number;
-  tradeSize: number;
-  tradeSide: number;
+  buyTradePrice: number;
+  buyTradeSize: number;
+  sellTradePrice: number;
+  sellTradeSize: number;
   anchorPrice: number;
+  depthScale: number;
   generatedAt: number;
   liquidity: Float32Array;
   book: Float32Array;
@@ -96,11 +98,13 @@ export function decodeFrame(buffer: ArrayBuffer): MarketFrame {
       sessionVolume: view.getFloat32(20, true),
       cumulativeDelta: view.getFloat32(24, true),
       imbalance: view.getFloat32(28, true),
-      tradePrice: view.getFloat32(32, true),
-      tradeSize: view.getFloat32(36, true),
-      tradeSide: view.getFloat32(40, true),
-      anchorPrice: view.getFloat32(44, true),
-      generatedAt: view.getFloat64(48, true),
+      buyTradePrice: view.getFloat32(32, true),
+      buyTradeSize: view.getFloat32(36, true),
+      sellTradePrice: view.getFloat32(40, true),
+      sellTradeSize: view.getFloat32(44, true),
+      anchorPrice: view.getFloat32(48, true),
+      depthScale: view.getFloat32(52, true),
+      generatedAt: view.getFloat64(56, true),
       liquidity: new Float32Array(buffer, UPDATE_HEADER_BYTES, rows),
       book: new Float32Array(buffer, UPDATE_HEADER_BYTES + rows * 4, BOOK_LEVELS * 3),
     };

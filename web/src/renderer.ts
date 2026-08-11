@@ -28,6 +28,7 @@ struct Uniforms {
 @group(0) @binding(0) var history_texture: texture_2d<f32>;
 @group(0) @binding(1) var live_texture: texture_2d<f32>;
 @group(0) @binding(2) var<uniform> uniforms: Uniforms;
+@group(0) @binding(3) var anchor_texture: texture_2d<f32>;
 
 @vertex
 fn vertex_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
@@ -48,8 +49,9 @@ fn unpack_depth(texel: vec4<f32>, channel: i32) -> f32 {
 
 fn history_depth(column: i32, row: i32) -> f32 {
   let level = i32(uniforms.view.z);
-  let packed_row = row / 4 + level * (i32(uniforms.market.w) / 4);
-  let channel = row - packed_row * 4;
+  let local_packed_row = row / 4;
+  let packed_row = local_packed_row + level * (i32(uniforms.market.w) / 4);
+  let channel = row - local_packed_row * 4;
   return unpack_depth(textureLoad(history_texture, vec2<i32>(column, packed_row), 0), channel);
 }
 
@@ -96,31 +98,35 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
   let plot_y = uv.y / plot_bottom;
   let price_offset = (0.5 - plot_y) * uniforms.view.w;
   let price = uniforms.market.x + price_offset * uniforms.market.z;
-  let row_f = uniforms.market.w * 0.5 - (price - uniforms.market.y) / uniforms.market.z;
-  let row = i32(round(row_f));
   var raw = 0.0;
   var age = 1.0;
 
-  if (row >= 0 && row < i32(uniforms.market.w)) {
-    if (uv.x < history_end) {
-      let count = i32(uniforms.history.x);
-      if (count > 0) {
-        let head = i32(uniforms.history.y);
-        let capacity = i32(uniforms.history.z);
-        let window = max(1, i32(floor(f32(capacity) / uniforms.view.y)));
-        let visible = min(count, window);
-        let skipped = max(0, count - visible);
-        let padding = window - visible;
-        let window_column = min(window - 1, i32(floor((uv.x / history_end) * f32(window))));
-        if (window_column >= padding) {
-          let logical = skipped + window_column - padding;
-          let oldest = (head + capacity - count) % capacity;
-          let physical = (oldest + logical) % capacity;
+  if (uv.x < history_end) {
+    let count = i32(uniforms.history.x);
+    if (count > 0) {
+      let head = i32(uniforms.history.y);
+      let capacity = i32(uniforms.history.z);
+      let window = max(1, i32(floor(f32(capacity) / uniforms.view.y)));
+      let visible = min(count, window);
+      let skipped = max(0, count - visible);
+      let padding = window - visible;
+      let window_column = min(window - 1, i32(floor((uv.x / history_end) * f32(window))));
+      if (window_column >= padding) {
+        let logical = skipped + window_column - padding;
+        let oldest = (head + capacity - count) % capacity;
+        let physical = (oldest + logical) % capacity;
+        let level = i32(uniforms.view.z);
+        let column_anchor = textureLoad(anchor_texture, vec2<i32>(physical, level), 0).r;
+        let row = i32(round(uniforms.market.w * 0.5 - (price - column_anchor) / uniforms.market.z));
+        if (row >= 0 && row < i32(uniforms.market.w)) {
           raw = history_depth(physical, row);
           age = 0.72 + 0.28 * f32(window_column - padding) / max(1.0, f32(visible - 1));
         }
       }
-    } else {
+    }
+  } else {
+    let row = i32(round(uniforms.market.w * 0.5 - (price - uniforms.market.y) / uniforms.market.z));
+    if (row >= 0 && row < i32(uniforms.market.w)) {
       raw = live_depth(row);
     }
   }
@@ -152,6 +158,7 @@ export interface ViewState {
   contrast: number;
   priceZoom: number;
   timeZoom: number;
+  timeOffsetSeconds: number;
 }
 
 export interface BookLevel {
@@ -168,6 +175,26 @@ interface HistoryView {
   windowCount: number;
   shaderScale: number;
   spanSeconds: number;
+  timeOffsetSeconds: number;
+  displayMidPrice: number;
+}
+
+interface TradeHistory {
+  buyPrices: Float32Array;
+  buySizes: Float32Array;
+  sellPrices: Float32Array;
+  sellSizes: Float32Array;
+  pendingBuyNotional: number;
+  pendingBuySize: number;
+  pendingSellNotional: number;
+  pendingSellSize: number;
+}
+
+interface TradeBubble {
+  x: number;
+  price: number;
+  size: number;
+  side: 1 | -1;
 }
 
 export class HeatmapRenderer {
@@ -177,6 +204,7 @@ export class HeatmapRenderer {
   readonly context: GPUCanvasContext;
   readonly format: GPUTextureFormat;
   readonly historyTexture: GPUTexture;
+  readonly anchorTexture: GPUTexture;
   readonly liveTexture: GPUTexture;
   readonly uniformBuffer: GPUBuffer;
   readonly bindGroup: GPUBindGroup;
@@ -185,9 +213,14 @@ export class HeatmapRenderer {
     { length: HISTORY_LEVELS },
     () => new Float32Array(HISTORY_CAPACITY),
   );
+  readonly anchorPrices = Array.from(
+    { length: HISTORY_LEVELS },
+    () => new Float32Array(HISTORY_CAPACITY),
+  );
+  readonly trades = Array.from({ length: HISTORY_LEVELS }, createTradeHistory);
   readonly liveLiquidity = new Float32Array(DEPTH_ROWS);
   instrument: Instrument;
-  view: ViewState = { contrast: 1.08, priceZoom: 1, timeZoom: 2.5 };
+  view: ViewState = { contrast: 1.08, priceZoom: 1, timeZoom: 2.5, timeOffsetSeconds: 0 };
   readonly historyCounts = new Uint32Array(HISTORY_LEVELS);
   readonly historyHeads = new Uint32Array(HISTORY_LEVELS);
   historyCommitCount = 0;
@@ -203,6 +236,7 @@ export class HeatmapRenderer {
   private frameCounter = 0;
   private fpsWindowStart = performance.now();
   private animationFrame = 0;
+  private drag?: { pointerId: number; startX: number; startOffset: number; spanSeconds: number };
 
   static async create(
     canvas: HTMLCanvasElement,
@@ -240,6 +274,12 @@ export class HeatmapRenderer {
       format: "rgba8unorm",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
+    this.anchorTexture = device.createTexture({
+      label: "history-price-anchors",
+      size: [HISTORY_CAPACITY, HISTORY_LEVELS],
+      format: "r32float",
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+    });
     this.liveTexture = device.createTexture({
       label: "mutable-live-book",
       size: [1, PACKED_ROWS],
@@ -266,16 +306,25 @@ export class HeatmapRenderer {
         { binding: 0, resource: this.historyTexture.createView() },
         { binding: 1, resource: this.liveTexture.createView() },
         { binding: 2, resource: { buffer: this.uniformBuffer } },
+        { binding: 3, resource: this.anchorTexture.createView() },
       ],
     });
 
     new ResizeObserver(() => this.resize()).observe(canvas.parentElement ?? canvas);
     overlay.addEventListener("wheel", (event) => this.handleWheel(event), { passive: false });
+    overlay.addEventListener("pointerdown", (event) => this.handlePointerDown(event));
     overlay.addEventListener("pointermove", (event) => {
       const bounds = overlay.getBoundingClientRect();
       this.pointer = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+      if (this.drag?.pointerId === event.pointerId) {
+        const historyWidth = this.getHistoryWidth();
+        const deltaSeconds = ((this.pointer.x - this.drag.startX) / historyWidth) * this.drag.spanSeconds;
+        this.setView({ timeOffsetSeconds: this.drag.startOffset + deltaSeconds }, true);
+      }
     });
-    overlay.addEventListener("pointerleave", () => { this.pointer = null; });
+    overlay.addEventListener("pointerup", (event) => this.handlePointerUp(event));
+    overlay.addEventListener("pointercancel", (event) => this.handlePointerUp(event));
+    overlay.addEventListener("pointerleave", () => { if (!this.drag) this.pointer = null; });
     this.device.lost.then((info) => console.error("WebGPU device lost", info));
     this.resize();
     this.renderLoop();
@@ -288,23 +337,34 @@ export class HeatmapRenderer {
     this.historyCounts.fill(0);
     this.historyHeads.fill(0);
     this.historyCommitCount = 0;
+    this.view.timeOffsetSeconds = 0;
     for (const prices of this.midPrices) prices.fill(0);
+    for (const anchors of this.anchorPrices) anchors.fill(0);
+    for (const trades of this.trades) resetTradeHistory(trades);
   }
 
   setView(next: Partial<ViewState>, notify = false): void {
+    const timeZoom = clamp(next.timeZoom ?? this.view.timeZoom, TIME_ZOOM_MIN, TIME_ZOOM_MAX);
+    const requestedSpan = this.getRequestedSpan(timeZoom);
+    const availableSeconds = this.getAvailableHistorySeconds();
+    const maximumOffset = Math.max(0, availableSeconds - Math.min(requestedSpan, availableSeconds));
     this.view = {
       contrast: clamp(next.contrast ?? this.view.contrast, 0.55, 1.8),
       priceZoom: clamp(next.priceZoom ?? this.view.priceZoom, 1, 3),
-      timeZoom: clamp(next.timeZoom ?? this.view.timeZoom, TIME_ZOOM_MIN, TIME_ZOOM_MAX),
+      timeZoom,
+      timeOffsetSeconds: clamp(next.timeOffsetSeconds ?? this.view.timeOffsetSeconds, 0, maximumOffset),
     };
     if (notify) this.onViewChange?.({ ...this.view });
   }
 
   uploadSnapshot(frame: SnapshotFrame): void {
     const packed = new Uint8Array(HISTORY_CAPACITY * PACKED_ROWS * HISTORY_LEVELS * 4);
+    const packedAnchors = new Float32Array(HISTORY_CAPACITY * HISTORY_LEVELS);
     this.historyCounts.fill(0);
     this.historyHeads.fill(0);
     this.historyCommitCount = 0;
+    this.view.timeOffsetSeconds = 0;
+    for (const trades of this.trades) resetTradeHistory(trades);
     for (let level = 0; level < HISTORY_LEVELS; level += 1) {
       const stride = HISTORY_LEVEL_INTERVALS[level] / HISTORY_INTERVAL_MS;
       const available = Math.ceil(frame.count / stride);
@@ -313,6 +373,8 @@ export class HeatmapRenderer {
       for (let column = 0; column < count; column += 1) {
         const sourceColumn = Math.min(frame.count - 1, sourceStart + (column + 1) * stride - 1);
         this.midPrices[level][column] = frame.midPrices[sourceColumn];
+        this.anchorPrices[level][column] = this.instrument.basePrice;
+        packedAnchors[level * HISTORY_CAPACITY + column] = this.instrument.basePrice;
         for (let row = 0; row < DEPTH_ROWS; row += 1) {
           const packedRow = level * PACKED_ROWS + Math.floor(row / 4);
           const channel = row % 4;
@@ -329,6 +391,12 @@ export class HeatmapRenderer {
       { bytesPerRow: HISTORY_CAPACITY * 4, rowsPerImage: PACKED_ROWS * HISTORY_LEVELS },
       [HISTORY_CAPACITY, PACKED_ROWS * HISTORY_LEVELS],
     );
+    this.device.queue.writeTexture(
+      { texture: this.anchorTexture },
+      packedAnchors,
+      { bytesPerRow: HISTORY_CAPACITY * 4, rowsPerImage: HISTORY_LEVELS },
+      [HISTORY_CAPACITY, HISTORY_LEVELS],
+    );
     this.midPrice = frame.midPrices[frame.count - 1] ?? this.instrument.basePrice;
   }
 
@@ -344,8 +412,20 @@ export class HeatmapRenderer {
       [1, PACKED_ROWS],
     );
     if (!frame.commit) return;
+    if (this.view.timeOffsetSeconds > 0) {
+      this.view.timeOffsetSeconds += HISTORY_INTERVAL_MS / 1000;
+    }
     this.historyCommitCount += 1;
     for (let level = 0; level < HISTORY_LEVELS; level += 1) {
+      const trades = this.trades[level];
+      if (frame.buyTradeSize > 0) {
+        trades.pendingBuyNotional += frame.buyTradePrice * frame.buyTradeSize;
+        trades.pendingBuySize += frame.buyTradeSize;
+      }
+      if (frame.sellTradeSize > 0) {
+        trades.pendingSellNotional += frame.sellTradePrice * frame.sellTradeSize;
+        trades.pendingSellSize += frame.sellTradeSize;
+      }
       const stride = HISTORY_LEVEL_INTERVALS[level] / HISTORY_INTERVAL_MS;
       if (level > 0 && this.historyCommitCount % stride !== 0) continue;
       const head = this.historyHeads[level];
@@ -356,6 +436,25 @@ export class HeatmapRenderer {
         [1, PACKED_ROWS],
       );
       this.midPrices[level][head] = frame.midPrice;
+      this.anchorPrices[level][head] = frame.anchorPrice;
+      this.device.queue.writeTexture(
+        { texture: this.anchorTexture, origin: [head, level] },
+        new Float32Array([frame.anchorPrice]),
+        { bytesPerRow: 4, rowsPerImage: 1 },
+        [1, 1],
+      );
+      trades.buyPrices[head] = trades.pendingBuySize > 0
+        ? trades.pendingBuyNotional / trades.pendingBuySize
+        : 0;
+      trades.buySizes[head] = trades.pendingBuySize;
+      trades.sellPrices[head] = trades.pendingSellSize > 0
+        ? trades.pendingSellNotional / trades.pendingSellSize
+        : 0;
+      trades.sellSizes[head] = trades.pendingSellSize;
+      trades.pendingBuyNotional = 0;
+      trades.pendingBuySize = 0;
+      trades.pendingSellNotional = 0;
+      trades.pendingSellSize = 0;
       this.historyHeads[level] = (head + 1) % HISTORY_CAPACITY;
       this.historyCounts[level] = Math.min(HISTORY_CAPACITY, this.historyCounts[level] + 1);
     }
@@ -384,7 +483,39 @@ export class HeatmapRenderer {
     event.preventDefault();
     const factor = Math.exp(-event.deltaY * 0.0014);
     if (event.shiftKey) this.setView({ priceZoom: this.view.priceZoom * factor }, true);
-    else this.setView({ timeZoom: this.view.timeZoom * factor }, true);
+    else {
+      const history = this.getHistoryView();
+      const nextZoom = clamp(this.view.timeZoom * factor, TIME_ZOOM_MIN, TIME_ZOOM_MAX);
+      const nextSpan = this.getRequestedSpan(nextZoom);
+      const bounds = this.overlay.getBoundingClientRect();
+      const pointerX = clamp(event.clientX - bounds.left, 0, this.getHistoryWidth());
+      const fractionFromNow = 1 - pointerX / this.getHistoryWidth();
+      const anchoredLookback = history.timeOffsetSeconds + fractionFromNow * history.spanSeconds;
+      const nextOffset = anchoredLookback - fractionFromNow * nextSpan;
+      this.setView({ timeZoom: nextZoom, timeOffsetSeconds: nextOffset }, true);
+    }
+  }
+
+  private handlePointerDown(event: PointerEvent): void {
+    if (event.button !== 0) return;
+    const bounds = this.overlay.getBoundingClientRect();
+    const x = event.clientX - bounds.left;
+    if (x < 0 || x > this.getHistoryWidth()) return;
+    this.overlay.setPointerCapture(event.pointerId);
+    this.drag = {
+      pointerId: event.pointerId,
+      startX: x,
+      startOffset: this.view.timeOffsetSeconds,
+      spanSeconds: this.getHistoryView().spanSeconds,
+    };
+    this.overlay.classList.add("dragging");
+  }
+
+  private handlePointerUp(event: PointerEvent): void {
+    if (this.drag?.pointerId !== event.pointerId) return;
+    this.drag = undefined;
+    this.overlay.classList.remove("dragging");
+    if (this.overlay.hasPointerCapture(event.pointerId)) this.overlay.releasePointerCapture(event.pointerId);
   }
 
   private resize(): void {
@@ -411,6 +542,7 @@ export class HeatmapRenderer {
   destroy(): void {
     cancelAnimationFrame(this.animationFrame);
     this.historyTexture.destroy();
+    this.anchorTexture.destroy();
     this.liveTexture.destroy();
     this.uniformBuffer.destroy();
   }
@@ -435,7 +567,7 @@ export class HeatmapRenderer {
       history.shaderScale,
       history.level,
       visibleRows,
-      this.midPrice,
+      history.displayMidPrice,
       this.anchorPrice,
       this.instrument.tickSize,
       DEPTH_ROWS,
@@ -488,43 +620,9 @@ export class HeatmapRenderer {
     const leftPadding = Math.max(0, history.windowCount - visibleCount);
     const oldest = (history.head + HISTORY_CAPACITY - history.count) % HISTORY_CAPACITY;
     const priceToY = (price: number) =>
-      plotHeight * 0.5 - ((price - this.midPrice) / this.instrument.tickSize) * (plotHeight / visibleRows);
-    const candleSpan = Math.max(2, Math.round(history.windowCount / Math.max(30, historyWidth / 8)));
-
-    context.lineWidth = 1;
-    for (let start = 0; start < visibleCount; start += candleSpan) {
-      const end = Math.min(visibleCount, start + candleSpan);
-      let open = 0;
-      let close = 0;
-      let high = Number.NEGATIVE_INFINITY;
-      let low = Number.POSITIVE_INFINITY;
-      for (let offset = start; offset < end; offset += 1) {
-        const physical = (oldest + skipped + offset) % HISTORY_CAPACITY;
-        const price = this.midPrices[history.level][physical];
-        if (offset === start) open = price;
-        close = price;
-        high = Math.max(high, price);
-        low = Math.min(low, price);
-      }
-      if (!Number.isFinite(high) || open === 0) continue;
-      const x = ((leftPadding + start + (end - start) * 0.5) / history.windowCount) * historyWidth;
-      const candleWidth = Math.max(2, ((end - start) / history.windowCount) * historyWidth * 0.72);
-      const openY = priceToY(open);
-      const closeY = priceToY(close);
-      const highY = priceToY(high + this.instrument.tickSize * 0.55);
-      const lowY = priceToY(low - this.instrument.tickSize * 0.55);
-      if (lowY < 0 || highY > plotHeight) continue;
-      context.strokeStyle = "rgba(238, 245, 243, .92)";
-      context.beginPath();
-      context.moveTo(x, highY);
-      context.lineTo(x, lowY);
-      context.stroke();
-      context.fillStyle = close >= open ? "#1fd66f" : "#f13c52";
-      const bodyY = Math.min(openY, closeY) - 1;
-      const bodyHeight = Math.max(2.5, Math.abs(closeY - openY) + 2);
-      context.fillRect(x - candleWidth / 2, bodyY, candleWidth, bodyHeight);
-      context.strokeRect(x - candleWidth / 2, bodyY, candleWidth, bodyHeight);
-    }
+      plotHeight * 0.5 - ((price - history.displayMidPrice) / this.instrument.tickSize) * (plotHeight / visibleRows);
+    this.drawPriceTrace(context, history, visibleCount, skipped, leftPadding, oldest, historyWidth, priceToY);
+    this.drawTradeBubbles(context, history, visibleCount, skipped, leftPadding, oldest, historyWidth, plotHeight, priceToY);
 
     context.strokeStyle = "rgba(229, 241, 238, .72)";
     context.lineWidth = 0.8;
@@ -548,24 +646,25 @@ export class HeatmapRenderer {
       const y = plotHeight * 0.5 - offset * (plotHeight / visibleRows);
       if (y < 8 || y > plotHeight - 8) continue;
       context.fillStyle = "#718b8f";
-      context.fillText(formatPrice(this.midPrice + offset * this.instrument.tickSize, this.instrument), plotWidth + 7, y);
+      context.fillText(formatPrice(history.displayMidPrice + offset * this.instrument.tickSize, this.instrument), plotWidth + 7, y);
     }
     context.fillStyle = "#1ab88f";
     context.fillRect(plotWidth, plotHeight * 0.5 - 10, PRICE_AXIS_WIDTH, 20);
     context.fillStyle = "#031510";
     context.textAlign = "center";
     context.font = "bold 9px ui-monospace, SFMono-Regular, Menlo, monospace";
-    context.fillText(formatPrice(this.midPrice, this.instrument), plotWidth + PRICE_AXIS_WIDTH / 2, plotHeight * 0.5);
+    context.fillText(formatPrice(history.displayMidPrice, this.instrument), plotWidth + PRICE_AXIS_WIDTH / 2, plotHeight * 0.5);
 
     context.font = "8px ui-monospace, SFMono-Regular, Menlo, monospace";
     context.fillStyle = "#526b70";
     context.textAlign = "center";
     for (const fraction of [0.2, 0.4, 0.6, 0.8]) {
-      context.fillText(`-${formatLookback((1 - fraction) * history.spanSeconds)}`, historyWidth * fraction, plotHeight + 11);
+      const lookback = history.timeOffsetSeconds + (1 - fraction) * history.spanSeconds;
+      context.fillText(`-${formatLookback(lookback)}`, historyWidth * fraction, plotHeight + 11);
     }
     context.textAlign = "right";
     context.fillStyle = "#24d0ab";
-    context.fillText("NOW", historyWidth - 4, plotHeight + 11);
+    context.fillText(history.timeOffsetSeconds < 0.05 ? "NOW" : `-${formatLookback(history.timeOffsetSeconds)}`, historyWidth - 4, plotHeight + 11);
 
     if (this.pointer && this.pointer.x < plotWidth && this.pointer.y < plotHeight) {
       context.strokeStyle = "rgba(220, 235, 232, .48)";
@@ -577,7 +676,7 @@ export class HeatmapRenderer {
       context.lineTo(plotWidth, this.pointer.y);
       context.stroke();
       const rowsFromMid = (plotHeight * 0.5 - this.pointer.y) / (plotHeight / visibleRows);
-      const pointerPrice = this.midPrice + rowsFromMid * this.instrument.tickSize;
+      const pointerPrice = history.displayMidPrice + rowsFromMid * this.instrument.tickSize;
       context.fillStyle = "rgba(13, 29, 34, .96)";
       context.fillRect(plotWidth, this.pointer.y - 10, PRICE_AXIS_WIDTH, 20);
       context.strokeStyle = "#526d72";
@@ -585,28 +684,172 @@ export class HeatmapRenderer {
       context.textAlign = "center";
       context.fillStyle = "#dceae8";
       context.fillText(formatPrice(pointerPrice, this.instrument), plotWidth + PRICE_AXIS_WIDTH / 2, this.pointer.y);
+      const lookback = this.pointer.x < historyWidth
+        ? history.timeOffsetSeconds + (1 - this.pointer.x / historyWidth) * history.spanSeconds
+        : 0;
+      const timeLabel = lookback < 0.05 ? "LIVE" : `-${formatLookback(lookback)}`;
+      const labelWidth = Math.max(44, context.measureText(timeLabel).width + 12);
+      const labelX = clamp(this.pointer.x - labelWidth / 2, 0, Math.max(0, historyWidth - labelWidth));
+      context.fillStyle = "rgba(9, 22, 27, .96)";
+      context.fillRect(labelX, plotHeight, labelWidth, TIME_AXIS_HEIGHT);
+      context.strokeStyle = "#385159";
+      context.strokeRect(labelX + 0.5, plotHeight + 0.5, labelWidth - 1, TIME_AXIS_HEIGHT - 1);
+      context.fillStyle = "#dceae8";
+      context.fillText(timeLabel, labelX + labelWidth / 2, plotHeight + 11);
     }
   }
 
+  private drawPriceTrace(
+    context: CanvasRenderingContext2D,
+    history: HistoryView,
+    visibleCount: number,
+    skipped: number,
+    leftPadding: number,
+    oldest: number,
+    historyWidth: number,
+    priceToY: (price: number) => number,
+  ): void {
+    if (visibleCount === 0) return;
+    const step = Math.max(1, Math.ceil(visibleCount / Math.max(120, historyWidth)));
+    context.save();
+    context.lineJoin = "round";
+    context.lineCap = "round";
+    context.beginPath();
+    let started = false;
+    for (let offset = 0; offset < visibleCount; offset += step) {
+      const physical = (oldest + skipped + offset) % HISTORY_CAPACITY;
+      const price = this.midPrices[history.level][physical];
+      if (price <= 0) continue;
+      const x = ((leftPadding + offset) / history.windowCount) * historyWidth;
+      const y = priceToY(price);
+      if (!started) {
+        context.moveTo(x, y);
+        started = true;
+      } else context.lineTo(x, y);
+    }
+    if (started) {
+      context.strokeStyle = "rgba(1, 7, 9, .86)";
+      context.lineWidth = 3.2;
+      context.stroke();
+      context.strokeStyle = "rgba(232, 246, 242, .92)";
+      context.lineWidth = 1.05;
+      context.stroke();
+    }
+    context.restore();
+  }
+
+  private drawTradeBubbles(
+    context: CanvasRenderingContext2D,
+    history: HistoryView,
+    visibleCount: number,
+    skipped: number,
+    leftPadding: number,
+    oldest: number,
+    historyWidth: number,
+    plotHeight: number,
+    priceToY: (price: number) => number,
+  ): void {
+    if (visibleCount === 0) return;
+    const trades = this.trades[history.level];
+    const groupSpan = Math.max(1, Math.ceil(visibleCount / Math.max(120, historyWidth / 4)));
+    const bubbles: TradeBubble[] = [];
+    for (let start = 0; start < visibleCount; start += groupSpan) {
+      const end = Math.min(visibleCount, start + groupSpan);
+      let buyNotional = 0;
+      let buySize = 0;
+      let sellNotional = 0;
+      let sellSize = 0;
+      for (let offset = start; offset < end; offset += 1) {
+        const physical = (oldest + skipped + offset) % HISTORY_CAPACITY;
+        const nextBuySize = trades.buySizes[physical];
+        const nextSellSize = trades.sellSizes[physical];
+        buyNotional += trades.buyPrices[physical] * nextBuySize;
+        buySize += nextBuySize;
+        sellNotional += trades.sellPrices[physical] * nextSellSize;
+        sellSize += nextSellSize;
+      }
+      const x = ((leftPadding + start + (end - start) * 0.5) / history.windowCount) * historyWidth;
+      if (buySize > 0) bubbles.push({ x, price: buyNotional / buySize, size: buySize, side: 1 });
+      if (sellSize > 0) bubbles.push({ x, price: sellNotional / sellSize, size: sellSize, side: -1 });
+    }
+    if (!bubbles.length) return;
+    const sortedSizes = bubbles.map((bubble) => bubble.size).sort((left, right) => left - right);
+    const referenceSize = sortedSizes[Math.floor((sortedSizes.length - 1) * 0.9)] || 1;
+    bubbles.sort((left, right) => right.size - left.size);
+    context.save();
+    for (const bubble of bubbles) {
+      const y = priceToY(bubble.price);
+      if (y < -18 || y > plotHeight + 18) continue;
+      const radius = clamp(2.5 + Math.sqrt(bubble.size / referenceSize) * 8.5, 3, 16);
+      const buy = bubble.side > 0;
+      context.beginPath();
+      context.arc(bubble.x, y, radius, 0, Math.PI * 2);
+      context.fillStyle = buy ? "rgba(24, 214, 151, .24)" : "rgba(255, 62, 96, .24)";
+      context.fill();
+      context.strokeStyle = buy ? "rgba(61, 240, 180, .92)" : "rgba(255, 92, 120, .94)";
+      context.lineWidth = 1.15;
+      context.stroke();
+      context.beginPath();
+      context.arc(bubble.x, y, Math.max(1.2, radius * 0.2), 0, Math.PI * 2);
+      context.fillStyle = buy ? "#52f0bd" : "#ff6f89";
+      context.fill();
+    }
+    context.restore();
+  }
+
   private getHistoryView(): HistoryView {
-    const highResolutionSpan = (HISTORY_CAPACITY * HISTORY_INTERVAL_MS) / 1000;
-    const requestedSpan = highResolutionSpan / this.view.timeZoom;
-    let level = 0;
-    for (let candidate = 1; candidate < HISTORY_LEVELS; candidate += 1) {
-      const previousCapacity = (HISTORY_CAPACITY * HISTORY_LEVEL_INTERVALS[candidate - 1]) / 1000;
-      if (requestedSpan > previousCapacity) level = candidate;
+    const requestedSpan = this.getRequestedSpan(this.view.timeZoom);
+    const maximumArchiveSpan = (HISTORY_CAPACITY * HISTORY_LEVEL_INTERVALS[HISTORY_LEVELS - 1]) / 1000;
+    const requestedOffset = clamp(this.view.timeOffsetSeconds, 0, Math.max(0, maximumArchiveSpan - requestedSpan));
+    const requestedReach = requestedSpan + requestedOffset;
+    let level = HISTORY_LEVELS - 1;
+    for (let candidate = 0; candidate < HISTORY_LEVELS; candidate += 1) {
+      const capacitySpan = (HISTORY_CAPACITY * HISTORY_LEVEL_INTERVALS[candidate]) / 1000;
+      if (requestedReach <= capacitySpan) {
+        level = candidate;
+        break;
+      }
     }
     const sampleMs = HISTORY_LEVEL_INTERVALS[level];
     const windowCount = clampInt(Math.ceil((requestedSpan * 1000) / sampleMs), 1, HISTORY_CAPACITY);
+    const totalCount = this.historyCounts[level];
+    const requestedOffsetColumns = Math.round((requestedOffset * 1000) / sampleMs);
+    const maximumOffsetColumns = Math.max(0, totalCount - Math.min(windowCount, totalCount));
+    const offsetColumns = clampInt(requestedOffsetColumns, 0, maximumOffsetColumns);
+    const count = totalCount - offsetColumns;
+    const head = (this.historyHeads[level] + HISTORY_CAPACITY - offsetColumns) % HISTORY_CAPACITY;
+    const endColumn = (head + HISTORY_CAPACITY - 1) % HISTORY_CAPACITY;
+    const displayMidPrice = count > 0 && this.midPrices[level][endColumn] > 0
+      ? this.midPrices[level][endColumn]
+      : this.midPrice;
     return {
       level,
       sampleMs,
-      count: this.historyCounts[level],
-      head: this.historyHeads[level],
+      count,
+      head,
       windowCount,
       shaderScale: HISTORY_CAPACITY / windowCount,
       spanSeconds: (windowCount * sampleMs) / 1000,
+      timeOffsetSeconds: (offsetColumns * sampleMs) / 1000,
+      displayMidPrice,
     };
+  }
+
+  private getRequestedSpan(timeZoom: number): number {
+    return (HISTORY_CAPACITY * HISTORY_INTERVAL_MS) / 1000 / timeZoom;
+  }
+
+  private getAvailableHistorySeconds(): number {
+    let available = 0;
+    for (let level = 0; level < HISTORY_LEVELS; level += 1) {
+      available = Math.max(available, (this.historyCounts[level] * HISTORY_LEVEL_INTERVALS[level]) / 1000);
+    }
+    return available;
+  }
+
+  private getHistoryWidth(): number {
+    const plotWidth = Math.max(100, this.width - PRICE_AXIS_WIDTH);
+    return Math.max(50, plotWidth - LIVE_BOOK_WIDTH);
   }
 }
 
@@ -621,6 +864,30 @@ function formatLookback(seconds: number): string {
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.round((seconds % 3600) / 60);
   return `${hours}:${minutes.toString().padStart(2, "0")}`;
+}
+
+function createTradeHistory(): TradeHistory {
+  return {
+    buyPrices: new Float32Array(HISTORY_CAPACITY),
+    buySizes: new Float32Array(HISTORY_CAPACITY),
+    sellPrices: new Float32Array(HISTORY_CAPACITY),
+    sellSizes: new Float32Array(HISTORY_CAPACITY),
+    pendingBuyNotional: 0,
+    pendingBuySize: 0,
+    pendingSellNotional: 0,
+    pendingSellSize: 0,
+  };
+}
+
+function resetTradeHistory(trades: TradeHistory): void {
+  trades.buyPrices.fill(0);
+  trades.buySizes.fill(0);
+  trades.sellPrices.fill(0);
+  trades.sellSizes.fill(0);
+  trades.pendingBuyNotional = 0;
+  trades.pendingBuySize = 0;
+  trades.pendingSellNotional = 0;
+  trades.pendingSellSize = 0;
 }
 
 function packColumn(liquidity: Float32Array): Uint8Array<ArrayBuffer> {

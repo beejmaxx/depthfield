@@ -1,6 +1,8 @@
 import "./style.css";
 
 import {
+  HISTORY_CAPACITY,
+  HISTORY_INTERVAL_MS,
   INSTRUMENTS,
   SNAPSHOT_KIND,
   type Instrument,
@@ -30,11 +32,14 @@ const symbolNav = element<HTMLElement>("symbols");
 const contrastInput = element<HTMLInputElement>("contrast");
 const priceZoomInput = element<HTMLInputElement>("price-zoom");
 const timeZoomInput = element<HTMLInputElement>("time-zoom");
+const aggregationSelect = element<HTMLSelectElement>("aggregation");
+const goLiveButton = element<HTMLButtonElement>("go-live");
 const pauseButton = element<HTMLButtonElement>("pause");
 const restartButton = element<HTMLButtonElement>("restart");
 const worker = new Worker(new URL("./market.worker.ts", import.meta.url), { type: "module" });
 
-let instrument = INSTRUMENTS[0];
+let baseInstrument = INSTRUMENTS[0];
+let instrument: Instrument = { ...baseInstrument };
 let renderer: HeatmapRenderer;
 let paused = false;
 let updateCount = 0;
@@ -108,9 +113,18 @@ function installControls(): void {
   contrastInput.addEventListener("input", () => renderer.setView({ contrast: contrastInput.valueAsNumber }));
   priceZoomInput.addEventListener("input", () => renderer.setView({ priceZoom: priceZoomInput.valueAsNumber }));
   timeZoomInput.addEventListener("input", () => renderer.setView({ timeZoom: sliderToTimeZoom(timeZoomInput.valueAsNumber) }));
+  aggregationSelect.addEventListener("change", () => applyAggregation(Number(aggregationSelect.value)));
   element<HTMLButtonElement>("reset").addEventListener("click", () => {
-    renderer.setView({ contrast: 1.08, priceZoom: 1, timeZoom: 2.5 }, true);
+    renderer.setView({ contrast: 1.08, priceZoom: 1, timeZoom: 2.5, timeOffsetSeconds: 0 }, true);
   });
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-span]")) {
+    button.addEventListener("click", () => {
+      const seconds = Number(button.dataset.span);
+      const baseSpan = (HISTORY_CAPACITY * HISTORY_INTERVAL_MS) / 1000;
+      renderer.setView({ timeZoom: baseSpan / seconds, timeOffsetSeconds: 0 }, true);
+    });
+  }
+  goLiveButton.addEventListener("click", () => renderer.setView({ timeOffsetSeconds: 0 }, true));
   pauseButton.addEventListener("click", () => {
     paused = !paused;
     renderer.paused = paused;
@@ -118,26 +132,66 @@ function installControls(): void {
     worker.postMessage({ type: paused ? "pause" : "resume" });
     text("connection-label", paused ? "PAUSED" : connectionLabel);
   });
-  restartButton.addEventListener("click", () => worker.postMessage({ type: "restart", symbol: instrument.symbol }));
+  restartButton.addEventListener("click", () => worker.postMessage({
+    type: "restart",
+    symbol: instrument.symbol,
+    tickSize: instrument.tickSize,
+  }));
 }
 
 function selectInstrument(next: Instrument): void {
-  instrument = next;
-  renderer.setInstrument(next);
-  text("symbol", next.symbol);
-  text("instrument-name", next.name);
-  text("venue", next.venue);
-  text("last-price", formatPrice(next.basePrice, next));
+  baseInstrument = next;
+  populateAggregation(next);
+  applyAggregation(next.tickSize);
+}
+
+function applyAggregation(tickSize: number): void {
+  instrument = {
+    ...baseInstrument,
+    tickSize,
+    decimals: Math.max(baseInstrument.decimals, decimalsForStep(tickSize)),
+  };
+  renderer.setInstrument(instrument);
+  renderer.setView({ timeOffsetSeconds: 0 }, true);
+  text("symbol", instrument.symbol);
+  text("instrument-name", instrument.name);
+  text("venue", instrument.venue);
+  text("last-price", formatPrice(instrument.basePrice, instrument));
   for (const button of symbolNav.querySelectorAll("button")) {
-    button.classList.toggle("active", button.getAttribute("data-symbol") === next.symbol);
+    button.classList.toggle("active", button.getAttribute("data-symbol") === instrument.symbol);
   }
-  worker.postMessage({ type: "start", symbol: next.symbol });
+  worker.postMessage({ type: "start", symbol: instrument.symbol, tickSize: instrument.tickSize });
+}
+
+function populateAggregation(next: Instrument): void {
+  aggregationSelect.replaceChildren();
+  for (const multiplier of [0.5, 1, 2, 5]) {
+    const tickSize = next.tickSize * multiplier;
+    const option = document.createElement("option");
+    option.value = tickSize.toString();
+    option.textContent = formatAggregation(tickSize);
+    option.selected = multiplier === 1;
+    aggregationSelect.append(option);
+  }
+}
+
+function formatAggregation(step: number): string {
+  return step.toLocaleString("en-US", {
+    minimumFractionDigits: decimalsForStep(step),
+    maximumFractionDigits: decimalsForStep(step),
+  });
+}
+
+function decimalsForStep(step: number): number {
+  const normalized = step.toFixed(8).replace(/0+$/, "");
+  return normalized.includes(".") ? normalized.length - normalized.indexOf(".") - 1 : 0;
 }
 
 function syncViewControls(view: ViewState): void {
   contrastInput.value = view.contrast.toString();
   priceZoomInput.value = view.priceZoom.toString();
   timeZoomInput.value = timeZoomToSlider(view.timeZoom).toString();
+  goLiveButton.disabled = view.timeOffsetSeconds < 0.05;
 }
 
 function sliderToTimeZoom(value: number): number {
@@ -154,6 +208,7 @@ function updateMetrics(frame: UpdateFrame): void {
   text("cumulative-delta", `${frame.cumulativeDelta >= 0 ? "+" : ""}${frame.cumulativeDelta.toFixed(1)}`);
   text("imbalance", `${frame.imbalance >= 0 ? "+" : ""}${(frame.imbalance * 100).toFixed(1)}%`);
   text("latency", `${Math.max(0, Math.round(Date.now() - frame.generatedAt))} ms`);
+  text("depth-scale", `P99 ${frame.depthScale < 10 ? frame.depthScale.toFixed(2) : frame.depthScale.toFixed(1)}`);
 }
 
 function createBookRows(): HTMLDivElement[] {

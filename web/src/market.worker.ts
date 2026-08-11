@@ -60,6 +60,7 @@ interface WorkerCommand {
   type: "start" | "restart" | "pause" | "resume";
   symbol?: string;
   source?: "binance" | "simulation";
+  tickSize?: number;
 }
 
 class MarketSimulation {
@@ -125,10 +126,12 @@ class MarketSimulation {
       sessionVolume: this.sessionVolume,
       cumulativeDelta: this.cumulativeDelta,
       imbalance: this.imbalance,
-      tradePrice: trade.price,
-      tradeSize: trade.size,
-      tradeSide: trade.side,
+      buyTradePrice: trade.side > 0 ? trade.price : 0,
+      buyTradeSize: trade.side > 0 ? trade.size : 0,
+      sellTradePrice: trade.side < 0 ? trade.price : 0,
+      sellTradeSize: trade.side < 0 ? trade.size : 0,
       generatedAt: Date.now(),
+      depthScale: 13.5,
       liquidity: this.liquidity,
       book: simulationBook(this),
     });
@@ -219,9 +222,10 @@ class BinanceFeed {
   liquidityFloor = 0;
   liquidityCeiling = 1;
   hasLiquidityRange = false;
-  tradePrice = 0;
-  tradeSize = 0;
-  tradeSide = 0;
+  buyTradeNotional = 0;
+  buyTradeSize = 0;
+  sellTradeNotional = 0;
+  sellTradeSize = 0;
   latestEventTime = Date.now();
 
   constructor(instrument: Instrument, generation: number) {
@@ -265,9 +269,13 @@ class BinanceFeed {
       const price = Number(data.p);
       const size = Number(data.q);
       const side = data.m ? -1 : 1;
-      this.tradePrice = price;
-      this.tradeSize += size;
-      this.tradeSide = side;
+      if (side > 0) {
+        this.buyTradeNotional += price * size;
+        this.buyTradeSize += size;
+      } else {
+        this.sellTradeNotional += price * size;
+        this.sellTradeSize += size;
+      }
       this.sessionVolume += size;
       this.cumulativeDelta += side * size;
       this.latestEventTime = data.E;
@@ -351,23 +359,23 @@ class BinanceFeed {
     const recenterDistance = DEPTH_ROWS * this.instrument.tickSize * 0.28;
     if (Math.abs(this.midPrice - this.anchorPrice) > recenterDistance) {
       this.anchorPrice = Math.round(this.midPrice / this.instrument.tickSize) * this.instrument.tickSize;
-      postBuffer(encodeSnapshot(new Float32Array(0), new Float32Array(0), this.sequence));
     }
     const sizes = new Float64Array(DEPTH_ROWS);
     for (const [price, size] of bids) addToBucket(sizes, price, size, this.anchorPrice, this.instrument.tickSize);
     for (const [price, size] of asks) addToBucket(sizes, price, size, this.anchorPrice, this.instrument.tickSize);
     const logs = [...sizes].filter((size) => size > 0).map((size) => Math.log1p(size)).sort((a, b) => a - b);
-    const targetFloor = logs[Math.floor(logs.length * 0.45)] ?? 0;
-    const targetCeiling = logs[Math.floor(logs.length * 0.98)] ?? 1;
+    const targetFloor = logs[Math.floor(logs.length * 0.35)] ?? 0;
+    const targetCeiling = logs[Math.floor(logs.length * 0.992)] ?? 1;
     if (!this.hasLiquidityRange) {
       this.liquidityFloor = targetFloor;
       this.liquidityCeiling = targetCeiling;
       this.hasLiquidityRange = true;
     } else {
-      this.liquidityFloor = this.liquidityFloor * 0.96 + targetFloor * 0.04;
-      this.liquidityCeiling = this.liquidityCeiling * 0.96 + targetCeiling * 0.04;
+      this.liquidityFloor += (targetFloor - this.liquidityFloor) * 0.025;
+      const ceilingAlpha = targetCeiling > this.liquidityCeiling ? 0.16 : 0.008;
+      this.liquidityCeiling += (targetCeiling - this.liquidityCeiling) * ceilingAlpha;
     }
-    const range = Math.max(0.08, this.liquidityCeiling - this.liquidityFloor);
+    const range = Math.max(0.12, this.liquidityCeiling - this.liquidityFloor);
     for (let row = 0; row < DEPTH_ROWS; row += 1) {
       if (sizes[row] === 0) this.liquidity[row] = 0;
       else {
@@ -400,16 +408,19 @@ class BinanceFeed {
       sessionVolume: this.sessionVolume,
       cumulativeDelta: this.cumulativeDelta,
       imbalance: this.imbalance,
-      tradePrice: this.tradePrice,
-      tradeSize: this.tradeSize,
-      tradeSide: this.tradeSide,
+      buyTradePrice: this.buyTradeSize > 0 ? this.buyTradeNotional / this.buyTradeSize : 0,
+      buyTradeSize: this.buyTradeSize,
+      sellTradePrice: this.sellTradeSize > 0 ? this.sellTradeNotional / this.sellTradeSize : 0,
+      sellTradeSize: this.sellTradeSize,
       generatedAt: this.latestEventTime,
+      depthScale: Math.expm1(this.liquidityCeiling),
       liquidity: this.liquidity,
       book: this.book,
     }));
-    this.tradePrice = 0;
-    this.tradeSize = 0;
-    this.tradeSide = 0;
+    this.buyTradeNotional = 0;
+    this.buyTradeSize = 0;
+    this.sellTradeNotional = 0;
+    this.sellTradeSize = 0;
   }
 
   private fail(reason: string): void {
@@ -428,10 +439,12 @@ interface UpdateValues {
   sessionVolume: number;
   cumulativeDelta: number;
   imbalance: number;
-  tradePrice: number;
-  tradeSize: number;
-  tradeSide: number;
+  buyTradePrice: number;
+  buyTradeSize: number;
+  sellTradePrice: number;
+  sellTradeSize: number;
   generatedAt: number;
+  depthScale: number;
   liquidity: Float32Array;
   book: Float32Array;
 }
@@ -442,11 +455,23 @@ let binanceFeed: BinanceFeed | undefined;
 let paused = false;
 let activeGeneration = 0;
 
-function startMarket(symbol: string, source: "binance" | "simulation" = "binance"): void {
+function startMarket(
+  symbol: string,
+  source: "binance" | "simulation" = "binance",
+  requestedTickSize?: number,
+): void {
   activeGeneration += 1;
   stopActiveSource();
   paused = false;
-  const instrument = INSTRUMENTS.find((candidate) => candidate.symbol === symbol) ?? INSTRUMENTS[0];
+  const baseInstrument = INSTRUMENTS.find((candidate) => candidate.symbol === symbol) ?? INSTRUMENTS[0];
+  const tickSize = requestedTickSize && Number.isFinite(requestedTickSize) && requestedTickSize > 0
+    ? requestedTickSize
+    : baseInstrument.tickSize;
+  const instrument: Instrument = {
+    ...baseInstrument,
+    tickSize,
+    decimals: Math.max(baseInstrument.decimals, decimalsForStep(tickSize)),
+  };
   if (source === "simulation") startSimulation(instrument, activeGeneration, true);
   else {
     binanceFeed = new BinanceFeed(instrument, activeGeneration);
@@ -475,7 +500,9 @@ function stopActiveSource(): void {
 
 worker.onmessage = (event: MessageEvent<WorkerCommand>) => {
   const command = event.data;
-  if (command.type === "start" || command.type === "restart") startMarket(command.symbol ?? INSTRUMENTS[0].symbol, command.source ?? "binance");
+  if (command.type === "start" || command.type === "restart") {
+    startMarket(command.symbol ?? INSTRUMENTS[0].symbol, command.source ?? "binance", command.tickSize);
+  }
   if (command.type === "pause") paused = true;
   if (command.type === "resume") paused = false;
 };
@@ -503,11 +530,13 @@ function encodeUpdate(values: UpdateValues): ArrayBuffer {
   view.setFloat32(20, values.sessionVolume, true);
   view.setFloat32(24, values.cumulativeDelta, true);
   view.setFloat32(28, values.imbalance, true);
-  view.setFloat32(32, values.tradePrice, true);
-  view.setFloat32(36, values.tradeSize, true);
-  view.setFloat32(40, values.tradeSide, true);
-  view.setFloat32(44, values.anchorPrice, true);
-  view.setFloat64(48, values.generatedAt, true);
+  view.setFloat32(32, values.buyTradePrice, true);
+  view.setFloat32(36, values.buyTradeSize, true);
+  view.setFloat32(40, values.sellTradePrice, true);
+  view.setFloat32(44, values.sellTradeSize, true);
+  view.setFloat32(48, values.anchorPrice, true);
+  view.setFloat32(52, values.depthScale, true);
+  view.setFloat64(56, values.generatedAt, true);
   new Float32Array(buffer, UPDATE_HEADER_BYTES, DEPTH_ROWS).set(values.liquidity);
   new Float32Array(buffer, UPDATE_HEADER_BYTES + DEPTH_ROWS * 4, BOOK_LEVELS * 3).set(values.book);
   return buffer;
@@ -581,6 +610,11 @@ function clamp(value: number, minimum: number, maximum: number): number {
 
 function clampInt(value: number, minimum: number, maximum: number): number {
   return Math.trunc(clamp(value, minimum, maximum));
+}
+
+function decimalsForStep(step: number): number {
+  const text = step.toFixed(8).replace(/0+$/, "");
+  return text.includes(".") ? text.length - text.indexOf(".") - 1 : 0;
 }
 
 export {};

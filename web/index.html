@@ -29,14 +29,20 @@
         <label>CONTRAST <input id="contrast" type="range" min="0.55" max="1.8" step="0.01" value="1.08" /></label>
         <label>PRICE <input id="price-zoom" type="range" min="1" max="3" step="0.01" value="1" /></label>
         <label>TIME <input id="time-zoom" type="range" min="0" max="100" step="0.1" value="72.2" /></label>
+        <div class="time-presets" aria-label="Time range presets">
+          <button data-span="5">5S</button><button data-span="30">30S</button><button data-span="120">2M</button><button data-span="900">15M</button>
+        </div>
+        <label>AGG <select id="aggregation" title="Changing aggregation starts a new depth timeline"></select></label>
+        <button id="go-live" class="quiet-button go-live" disabled>● LIVE</button>
         <button id="reset" class="quiet-button">RESET VIEW</button>
-        <span class="toolbar-note">WHEEL: TIME · SHIFT+WHEEL: PRICE</span>
+        <span class="toolbar-note">DRAG: PAN · WHEEL: TIME · SHIFT+WHEEL: PRICE</span>
       </section>
 
       <main class="workspace">
         <section id="chart-stage" class="chart-stage">
           <canvas id="heatmap" aria-label="Liquidity heatmap"></canvas>
           <canvas id="overlay" aria-hidden="true"></canvas>
+          <div class="heat-legend"><span>DEPTH</span><i></i><b id="depth-scale">P99 —</b></div>
           <div id="gpu-error" class="gpu-error" hidden></div>
         </section>
 

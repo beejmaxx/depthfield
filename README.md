@@ -11,6 +11,11 @@ The web application connects directly from its worker to Binance's public spot m
 
 ## Web application
 
+Live demos:
+
+- GitHub Pages: <https://beejmaxx.github.io/depthfield/>
+- Netlify: <https://depthfield-live.netlify.app/>
+
 The browser client is intentionally not an egui-to-WASM port. Its hot path is designed for the web:
 
 - direct WebGPU heatmap rendering with one full-screen draw
@@ -21,6 +26,10 @@ The browser client is intentionally not an egui-to-WASM port. Its hot path is de
 - a correctly sequenced Binance snapshot-plus-diff order book
 - raw trades plus real-time best-bid/ask, volume, delta, imbalance, and aggregated order-book quantities
 - a 50 Hz recent timeline with 200 ms and 1 s archive levels for smooth zoom from about 5 seconds to 68 minutes
+- buy/sell trade bubbles, a lightweight price trace, cursor-anchored zoom, historical panning, and time presets
+- selectable price aggregation shared by the heatmap, price axis, and order-book ladder
+- per-column price anchors so recorded history survives automatic vertical recentering
+- slowly adapting percentile intensity normalization with a visible depth scale
 - shader-side colour mapping, contrast, time zoom, and price zoom
 - DOM UI outside the chart, keeping the chart renderer independent
 

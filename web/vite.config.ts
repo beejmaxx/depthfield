@@ -6,6 +6,7 @@ const isolationHeaders = {
 };
 
 export default defineConfig({
+  base: process.env.GITHUB_PAGES === "true" ? "/depthfield/" : "/",
   server: { headers: isolationHeaders },
   preview: { headers: isolationHeaders },
   build: {
