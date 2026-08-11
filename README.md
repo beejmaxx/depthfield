@@ -1,117 +1,172 @@
+<div align="center">
+
 # Depthfield
 
-Depthfield is a clean-room, GPU-rendered market-depth workstation for native macOS and the web. It explores the general idea of liquidity heatmaps without using Bookmap code, assets, protocols, or reverse-engineered implementation details.
+### A fast, open-source market-depth heatmap for the browser
 
-The repository currently contains two working prototypes:
+Watch resting liquidity evolve, disappear, and trade in real time. Depthfield connects directly to public exchange data and renders the order book with WebGPU—no account, API key, extension, or backend required.
 
-- a native Rust/egui/wgpu macOS application
-- a dedicated TypeScript/WebGPU browser application
+[![Deploy web demo to GitHub Pages](https://github.com/beejmaxx/depthfield/actions/workflows/pages.yml/badge.svg)](https://github.com/beejmaxx/depthfield/actions/workflows/pages.yml)
+[![Live demo](https://img.shields.io/badge/demo-live-24d0ab)](https://beejmaxx.github.io/depthfield/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-6c8589.svg)](LICENSE)
 
-The web application connects directly from its worker to Binance's public spot market-data endpoints by default. It requires no account, API key, or trading credentials. If Binance is unavailable, it automatically switches to the deterministic local simulator. The native application currently uses synthetic data.
+**[Launch Depthfield](https://beejmaxx.github.io/depthfield/)** · [Netlify mirror](https://depthfield-live.netlify.app/) · [Report a bug](https://github.com/beejmaxx/depthfield/issues)
 
-## Web application
+</div>
 
-Live demos:
+![Depthfield displaying the live BTCUSDT order-book heatmap](docs/depthfield-live.png)
 
-- GitHub Pages: <https://beejmaxx.github.io/depthfield/>
-- Netlify: <https://depthfield-live.netlify.app/>
+> [!IMPORTANT]
+> Depthfield is experimental market-visualization software, not a trading platform or financial advice. Verify data independently before relying on it.
 
-The browser client is intentionally not an egui-to-WASM port. Its hot path is designed for the web:
+## Why Depthfield?
 
-- direct WebGPU heatmap rendering with one full-screen draw
-- a three-level, 4,096-column circular GPU history pyramid, so historical pixels are never shifted
-- immutable committed history and a separately updated live-book texture
-- binary transferable worker messages rather than JSON market events
-- market simulation and decoding off the main UI thread
-- a correctly sequenced Binance snapshot-plus-diff order book
-- raw trades plus real-time best-bid/ask, volume, delta, imbalance, and aggregated order-book quantities
-- a 50 Hz recent timeline with 200 ms and 1 s archive levels for smooth zoom from about 5 seconds to 68 minutes
-- buy/sell trade bubbles, a lightweight price trace, cursor-anchored zoom, historical panning, and time presets
-- selectable price aggregation shared by the heatmap, price axis, and order-book ladder
-- per-column price anchors so recorded history survives automatic vertical recentering
-- slowly adapting percentile intensity normalization with a visible depth scale
-- shader-side colour mapping, contrast, time zoom, and price zoom
-- DOM UI outside the chart, keeping the chart renderer independent
+Most depth charts show only the order book *now*. A liquidity heatmap makes the missing dimension visible: where orders were resting, when they were added or pulled, and how price reacted as liquidity changed.
 
-Run it locally:
+Depthfield is built as a transparent, clean-room implementation that anyone can inspect, run, and improve. The web app is the primary experience; the repository also contains an earlier native Rust prototype.
+
+## Highlights
+
+| Capability | Implementation |
+| --- | --- |
+| Live public data | BTCUSDT, ETHUSDT, and SOLUSDT from Binance Spot |
+| Zero credentials | Public REST snapshot and WebSocket streams connect directly from a Web Worker |
+| GPU rendering | One-pass WebGPU heatmap with circular textures; historical pixels are never shifted |
+| Honest book state | Snapshot-plus-diff sequencing, gap detection, and automatic simulator fallback |
+| Live executions | Volume-scaled buy/sell trade bubbles and cumulative delta |
+| Deep zoom | Multi-resolution 20 ms, 200 ms, and 1 s history levels covering roughly 5 seconds to 68 minutes |
+| Navigation | Cursor-anchored zoom, drag-to-pan, time presets, crosshair inspection, and return-to-live |
+| Price aggregation | One setting shared by the heatmap, price axis, and order-book ladder |
+| Stable intensity | Slowly adapting percentile normalization and a visible liquidity scale |
+| Long-range correctness | Per-column price anchors preserve history when the live book recenters |
+
+The exchange depth source currently delivers changes at **100 ms**. Depthfield records those real states on a **50 Hz display timeline** while best bid/ask and raw trades arrive in real time. Repeated display samples represent an unchanged book—they are not invented orders.
+
+## Run locally
+
+Requirements:
+
+- Node.js 22 or newer
+- a current WebGPU-capable browser
+- hardware acceleration enabled
 
 ```bash
-cd web
-npm install
+git clone https://github.com/beejmaxx/depthfield.git
+cd depthfield/web
+npm ci
 npm run dev
 ```
 
-Then open `http://127.0.0.1:5173`. A current WebGPU-capable browser and hardware acceleration are required.
+Open <http://127.0.0.1:5173>.
 
-The live heatmap begins accumulating depth history when the page connects. Zoomed-out windows remain empty before the session start instead of stretching or inventing data. Binance's public API provides the current order book and subsequent changes, not historical depth from before the session.
-
-Create an optimized build:
+Build the optimized application:
 
 ```bash
-cd web
 npm run build
 npm run preview
 ```
 
-Controls:
+If Binance public endpoints are unavailable in your region or network, Depthfield automatically switches to its deterministic local simulator.
 
-- mouse wheel over the chart: horizontal time zoom
-- Shift + mouse wheel: vertical price zoom
-- toolbar sliders: contrast, price zoom, and time zoom
-- pause/resume: freeze and resume market updates
+## Controls
 
-## Native macOS application
+| Action | Control |
+| --- | --- |
+| Zoom through time | Mouse wheel or the **TIME** slider |
+| Zoom through price | **Shift + mouse wheel** or the **PRICE** slider |
+| Inspect history | Move the crosshair over the chart |
+| Pan backward | Drag the historical chart horizontally |
+| Return to the current book | **LIVE** |
+| Select a time window | **5S**, **30S**, **2M**, or **15M** |
+| Change price buckets | **AGG** selector |
+| Freeze incoming updates | **PAUSE** |
 
-Run from source:
+## How it works
+
+```text
+Binance public REST snapshot + WebSocket diffs / BBO / trades
+                              │
+                              ▼
+               sequence-aware market Web Worker
+                              │
+                 compact transferable binary frames
+                              │
+                              ▼
+        20 ms ─────── 200 ms ─────── 1 s circular history
+                              │
+             liquidity texture + per-column anchors
+                              │
+                              ▼
+          WebGPU heatmap + Canvas trade/interaction overlay
+```
+
+The past and present are deliberately separate. Once a depth column moves behind the live boundary it is never rewritten; only the live-book texture remains mutable.
+
+Important source boundaries:
+
+- [`web/src/market.worker.ts`](web/src/market.worker.ts) — public feeds, book sequencing, aggregation, metrics, and simulation fallback
+- [`web/src/protocol.ts`](web/src/protocol.ts) — compact worker-to-UI binary frame contract
+- [`web/src/renderer.ts`](web/src/renderer.ts) — circular WebGPU history, level-of-detail selection, trades, and interactions
+- [`web/src/main.ts`](web/src/main.ts) — application state, controls, metrics, and order-book UI
+- [`src/`](src/) — the native Rust/egui/wgpu prototype
+
+## Data and limitations
+
+- History begins when the page connects. Binance's public API does not provide historical order-book depth from before the session.
+- Browser history currently lives in memory and is cleared by a refresh or instrument/aggregation change.
+- Zoomed-out space before session start remains empty rather than being stretched or fabricated.
+- This project reads public market data only. It does not place or manage orders.
+- Availability, latency, and symbol rules remain subject to the exchange and the user's network.
+
+## Deployment
+
+Every relevant push to `main` is built and published by [GitHub Actions](.github/workflows/pages.yml). The Vite configuration derives the repository name during the Pages build, so forks can enable **Settings → Pages → GitHub Actions** without changing asset paths.
+
+The included [`netlify.toml`](netlify.toml) provides the production build settings and cross-origin isolation headers for Netlify deployments.
+
+## Native prototype
+
+The native macOS prototype uses Rust, egui, and wgpu. It currently runs against synthetic data:
 
 ```bash
 cargo run --release
 ```
 
-Create a macOS application bundle:
+Build a macOS application bundle:
 
 ```bash
 sh scripts/package-macos.sh
 open dist/Depthfield.app
 ```
 
-## Architecture
+## Roadmap
 
-```text
-Exchange adapters / deterministic simulator
-                    │
-         compact normalized deltas
-                    │
-        binary WebSocket or Worker frames
-                    │
-          preallocated circular buffers
-                    │
-     WebGPU history texture + live texture
-                    │
-          candles, ladder, interactions
+- [x] Direct public Binance Spot data
+- [x] GPU heatmap, live book, multi-resolution zoom, and trade bubbles
+- [x] Static hosting on GitHub Pages and Netlify
+- [ ] IndexedDB recording that survives refreshes
+- [ ] Deterministic replay and timeline scrubbing
+- [ ] Reconnect/resume telemetry and captured-feed correctness tests
+- [ ] Coinbase and Kraken adapters
+- [ ] Optional 24/7 collector for genuine pre-session history
+- [ ] Rust/WASM acceleration where profiling demonstrates a real benefit
+
+## Contributing
+
+Issues, focused pull requests, performance traces, data-integrity tests, and exchange adapters are welcome. Good first contributions include accessibility improvements, additional palettes, replay fixtures, and UI tests.
+
+Before opening a pull request:
+
+```bash
+cd web
+npm ci
+npm run build
 ```
 
-Important source boundaries:
-
-- `src/market.rs` owns the native normalized market model and simulation.
-- `src/heatmap.rs` draws the native heatmap with egui's GPU painter.
-- `src/app.rs` owns the native workstation composition.
-- `web/src/protocol.ts` defines the browser's compact binary frame contract.
-- `web/src/market.worker.ts` owns the direct public Binance connection, snapshot synchronization, sequence validation, aggregation, and simulator fallback off the main thread.
-- `web/src/renderer.ts` owns the circular WebGPU textures and chart rendering.
-- `web/src/main.ts` connects the renderer, worker, and web-native controls.
-
-The development server sends cross-origin-isolation headers so a future Rust/WASM engine can use shared memory without changing the frontend architecture.
-
-## Production roadmap
-
-1. Add recording and deterministic replay so a new session can load genuine historical depth.
-2. Build an optional Rust feed service for multi-venue aggregation and long-lived recording.
-3. Add reconnect-with-resume and deeper operational telemetry around stream gaps.
-4. Move CPU-heavy aggregation into Rust/WASM only where profiling justifies it.
-5. Add GPU-instanced trades, volume, annotations, and order placement overlays.
-6. Validate latency, dropped-frame behavior, and book correctness against captured exchange data.
+Please keep the implementation clean-room. Do not submit copied proprietary code, assets, protocols, or reverse-engineered internals from commercial products.
 
 ## License
 
-MIT
+[MIT](LICENSE) © Depthfield contributors.
+
+Depthfield is an independent project and is not affiliated with or endorsed by Binance or any commercial market-visualization vendor. Product and company names belong to their respective owners.
