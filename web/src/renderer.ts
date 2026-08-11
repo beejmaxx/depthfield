@@ -5,6 +5,7 @@ import {
   HISTORY_LEVEL_INTERVALS,
   HISTORY_LEVELS,
   type Instrument,
+  type RecordedHistory,
   type SnapshotFrame,
   type UpdateFrame,
   formatPrice,
@@ -400,6 +401,72 @@ export class HeatmapRenderer {
     this.midPrice = frame.midPrices[frame.count - 1] ?? this.instrument.basePrice;
   }
 
+  uploadRecordedHistory(history: RecordedHistory): void {
+    const packed = new Uint8Array(HISTORY_CAPACITY * PACKED_ROWS * HISTORY_LEVELS * 4);
+    const packedAnchors = new Float32Array(HISTORY_CAPACITY * HISTORY_LEVELS);
+    this.historyCounts.fill(0);
+    this.historyHeads.fill(0);
+    this.historyCommitCount = 0;
+    this.view.timeOffsetSeconds = 0;
+    for (const prices of this.midPrices) prices.fill(0);
+    for (const anchors of this.anchorPrices) anchors.fill(0);
+    for (const trades of this.trades) resetTradeHistory(trades);
+
+    let latestSample: RecordedHistory["levels"][number]["samples"][number] | undefined;
+    for (const archiveLevel of history.levels) {
+      const level = archiveLevel.level;
+      if (level < 0 || level >= HISTORY_LEVELS) continue;
+      const samples = archiveLevel.samples.slice(-HISTORY_CAPACITY);
+      const trades = this.trades[level];
+      samples.forEach((sample, column) => {
+        this.midPrices[level][column] = sample.midPrice;
+        this.anchorPrices[level][column] = sample.anchorPrice;
+        packedAnchors[level * HISTORY_CAPACITY + column] = sample.anchorPrice;
+        for (let row = 0; row < DEPTH_ROWS; row += 1) {
+          const packedRow = level * PACKED_ROWS + Math.floor(row / 4);
+          const channel = row % 4;
+          const target = (packedRow * HISTORY_CAPACITY + column) * 4 + channel;
+          packed[target] = sample.liquidity[row] ?? 0;
+        }
+        trades.buyPrices[column] = sample.buyTradePrice;
+        trades.buySizes[column] = sample.buyTradeSize;
+        trades.sellPrices[column] = sample.sellTradePrice;
+        trades.sellSizes[column] = sample.sellTradeSize;
+        if (sample.midPrice > 0 && (!latestSample || sample.timestamp > latestSample.timestamp)) latestSample = sample;
+      });
+      this.historyCounts[level] = samples.length;
+      this.historyHeads[level] = samples.length % HISTORY_CAPACITY;
+      if (level === 0) this.historyCommitCount = samples.length;
+    }
+
+    this.device.queue.writeTexture(
+      { texture: this.historyTexture },
+      packed,
+      { bytesPerRow: HISTORY_CAPACITY * 4, rowsPerImage: PACKED_ROWS * HISTORY_LEVELS },
+      [HISTORY_CAPACITY, PACKED_ROWS * HISTORY_LEVELS],
+    );
+    this.device.queue.writeTexture(
+      { texture: this.anchorTexture },
+      packedAnchors,
+      { bytesPerRow: HISTORY_CAPACITY * 4, rowsPerImage: HISTORY_LEVELS },
+      [HISTORY_CAPACITY, HISTORY_LEVELS],
+    );
+    if (latestSample) {
+      this.midPrice = latestSample.midPrice;
+      this.anchorPrice = latestSample.anchorPrice;
+      for (let row = 0; row < DEPTH_ROWS; row += 1) {
+        this.liveLiquidity[row] = latestSample.liquidity[row] / 255;
+      }
+      this.device.queue.writeTexture(
+        { texture: this.liveTexture },
+        new Uint8Array(latestSample.liquidity),
+        { bytesPerRow: 4, rowsPerImage: PACKED_ROWS },
+        [1, PACKED_ROWS],
+      );
+    }
+    this.onViewChange?.({ ...this.view });
+  }
+
   uploadUpdate(frame: UpdateFrame): void {
     this.midPrice = frame.midPrice;
     this.anchorPrice = frame.anchorPrice;
@@ -719,7 +786,10 @@ export class HeatmapRenderer {
     for (let offset = 0; offset < visibleCount; offset += step) {
       const physical = (oldest + skipped + offset) % HISTORY_CAPACITY;
       const price = this.midPrices[history.level][physical];
-      if (price <= 0) continue;
+      if (price <= 0) {
+        started = false;
+        continue;
+      }
       const x = ((leftPadding + offset) / history.windowCount) * historyWidth;
       const y = priceToY(price);
       if (!started) {

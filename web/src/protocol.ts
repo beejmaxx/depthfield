@@ -73,6 +73,32 @@ export interface UpdateFrame {
   book: Float32Array;
 }
 
+export interface RecordedHistorySample {
+  timestamp: number;
+  midPrice: number;
+  anchorPrice: number;
+  depthScale: number;
+  buyTradePrice: number;
+  buyTradeSize: number;
+  sellTradePrice: number;
+  sellTradeSize: number;
+  liquidity: Uint8Array;
+}
+
+export interface RecordedHistoryLevel {
+  level: number;
+  intervalMs: number;
+  samples: RecordedHistorySample[];
+}
+
+export interface RecordedHistory {
+  symbol: string;
+  tickSize: number;
+  startTime: number;
+  endTime: number;
+  levels: RecordedHistoryLevel[];
+}
+
 export type MarketFrame = SnapshotFrame | UpdateFrame;
 
 export function decodeFrame(buffer: ArrayBuffer): MarketFrame {

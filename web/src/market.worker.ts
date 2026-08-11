@@ -57,7 +57,7 @@ interface BinanceSnapshot {
 }
 
 interface WorkerCommand {
-  type: "start" | "restart" | "pause" | "resume";
+  type: "start" | "restart" | "stop" | "pause" | "resume";
   symbol?: string;
   source?: "binance" | "simulation";
   tickSize?: number;
@@ -329,7 +329,6 @@ class BinanceFeed {
       this.ready = true;
       if (this.connectTimer !== undefined) clearTimeout(this.connectTimer);
       this.rebuildNormalizedBook();
-      postBuffer(encodeSnapshot(new Float32Array(0), new Float32Array(0), 0));
       this.emitTimer = worker.setInterval(() => this.emit(), HISTORY_INTERVAL_MS);
       postStatus("live", "BINANCE PUBLIC", "100 ms depth + real-time BBO/trades on a 50 Hz timeline");
     } catch (error) {
@@ -502,6 +501,11 @@ worker.onmessage = (event: MessageEvent<WorkerCommand>) => {
   const command = event.data;
   if (command.type === "start" || command.type === "restart") {
     startMarket(command.symbol ?? INSTRUMENTS[0].symbol, command.source ?? "binance", command.tickSize);
+  }
+  if (command.type === "stop") {
+    activeGeneration += 1;
+    stopActiveSource();
+    paused = false;
   }
   if (command.type === "pause") paused = true;
   if (command.type === "resume") paused = false;

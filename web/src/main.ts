@@ -17,6 +17,7 @@ import {
   type BookLevel,
   type ViewState,
 } from "./renderer";
+import { HistoryRecorder, HistoryStore } from "./history-store";
 
 interface WorkerStatus {
   type: "status";
@@ -36,7 +37,14 @@ const aggregationSelect = element<HTMLSelectElement>("aggregation");
 const goLiveButton = element<HTMLButtonElement>("go-live");
 const pauseButton = element<HTMLButtonElement>("pause");
 const restartButton = element<HTMLButtonElement>("restart");
+const exportHistoryButton = element<HTMLButtonElement>("export-history");
+const importHistoryButton = element<HTMLButtonElement>("import-history");
+const historyFileInput = element<HTMLInputElement>("history-file");
 const worker = new Worker(new URL("./market.worker.ts", import.meta.url), { type: "module" });
+const historyStore = new HistoryStore();
+const historyRecorder = new HistoryRecorder(historyStore, (error) => {
+  setHistoryStatus("LOCAL SAVE ERROR", error.message, true);
+});
 
 let baseInstrument = INSTRUMENTS[0];
 let instrument: Instrument = { ...baseInstrument };
@@ -46,6 +54,9 @@ let updateCount = 0;
 let rateWindowStart = performance.now();
 let lastBookUpdate = 0;
 let connectionLabel = "CONNECTING";
+let selectionGeneration = 0;
+let recordingLive = false;
+let noticeTimer = 0;
 const bookRows = createBookRows();
 
 try {
@@ -53,7 +64,7 @@ try {
   renderer.onFps = (fps) => { text("fps", fps.toString()); };
   renderer.onViewChange = syncViewControls;
   installControls();
-  selectInstrument(instrument);
+  void selectInstrument(instrument);
 } catch (error) {
   const message = error instanceof Error ? error.message : String(error);
   gpuError.hidden = false;
@@ -73,6 +84,9 @@ worker.onmessage = (event: MessageEvent<ArrayBuffer | WorkerStatus>) => {
         : event.data.label;
     text("source-status", sourceStatus);
     element("connection-label").title = event.data.detail;
+    recordingLive = event.data.state === "live";
+    historyRecorder.setEnabled(recordingLive);
+    if (recordingLive) void refreshHistoryStatus();
     return;
   }
   const frame = decodeFrame(event.data);
@@ -81,6 +95,7 @@ worker.onmessage = (event: MessageEvent<ArrayBuffer | WorkerStatus>) => {
     return;
   }
   renderer.uploadUpdate(frame);
+  historyRecorder.record(frame);
   updateMetrics(frame);
   updateCount += 1;
   const now = performance.now();
@@ -107,13 +122,13 @@ function installControls(): void {
     button.type = "button";
     button.textContent = `${candidate.symbol}  ${candidate.venue}`;
     button.dataset.symbol = candidate.symbol;
-    button.addEventListener("click", () => selectInstrument(candidate));
+    button.addEventListener("click", () => { void selectInstrument(candidate); });
     symbolNav.append(button);
   }
   contrastInput.addEventListener("input", () => renderer.setView({ contrast: contrastInput.valueAsNumber }));
   priceZoomInput.addEventListener("input", () => renderer.setView({ priceZoom: priceZoomInput.valueAsNumber }));
   timeZoomInput.addEventListener("input", () => renderer.setView({ timeZoom: sliderToTimeZoom(timeZoomInput.valueAsNumber) }));
-  aggregationSelect.addEventListener("change", () => applyAggregation(Number(aggregationSelect.value)));
+  aggregationSelect.addEventListener("change", () => { void applyAggregation(Number(aggregationSelect.value)); });
   element<HTMLButtonElement>("reset").addEventListener("click", () => {
     renderer.setView({ contrast: 1.08, priceZoom: 1, timeZoom: 2.5, timeOffsetSeconds: 0 }, true);
   });
@@ -137,15 +152,27 @@ function installControls(): void {
     symbol: instrument.symbol,
     tickSize: instrument.tickSize,
   }));
+  exportHistoryButton.addEventListener("click", () => { void exportHistory(); });
+  importHistoryButton.addEventListener("click", () => historyFileInput.click());
+  historyFileInput.addEventListener("change", () => { void importHistory(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") void historyRecorder.flush();
+  });
+  window.addEventListener("pagehide", () => { void historyRecorder.flush(); });
+  window.setInterval(() => { if (recordingLive) void refreshHistoryStatus(); }, 15_000);
 }
 
-function selectInstrument(next: Instrument): void {
+async function selectInstrument(next: Instrument): Promise<void> {
   baseInstrument = next;
   populateAggregation(next);
-  applyAggregation(next.tickSize);
+  await applyAggregation(next.tickSize);
 }
 
-function applyAggregation(tickSize: number): void {
+async function applyAggregation(tickSize: number): Promise<void> {
+  const generation = ++selectionGeneration;
+  recordingLive = false;
+  historyRecorder.setEnabled(false);
+  worker.postMessage({ type: "stop" });
   instrument = {
     ...baseInstrument,
     tickSize,
@@ -160,7 +187,103 @@ function applyAggregation(tickSize: number): void {
   for (const button of symbolNav.querySelectorAll("button")) {
     button.classList.toggle("active", button.getAttribute("data-symbol") === instrument.symbol);
   }
+  setHistoryStatus("LOADING LOCAL HISTORY", "Restoring genuine depth recorded by this browser");
+  try {
+    await historyRecorder.useStream(instrument.symbol, instrument.tickSize);
+    const history = await historyStore.loadRecent(instrument.symbol, instrument.tickSize);
+    if (generation !== selectionGeneration) return;
+    if (history.endTime > 0) renderer.uploadRecordedHistory(history);
+    await refreshHistoryStatus();
+    void historyStore.prune(instrument.symbol, instrument.tickSize);
+  } catch (error) {
+    if (generation !== selectionGeneration) return;
+    const message = error instanceof Error ? error.message : String(error);
+    setHistoryStatus("LOCAL HISTORY OFF", message, true);
+  }
+  if (generation !== selectionGeneration) return;
   worker.postMessage({ type: "start", symbol: instrument.symbol, tickSize: instrument.tickSize });
+}
+
+async function exportHistory(): Promise<void> {
+  exportHistoryButton.disabled = true;
+  try {
+    await historyRecorder.flush();
+    const blob = await historyStore.exportRecording(instrument.symbol, instrument.tickSize);
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `depthfield-${instrument.symbol}-${new Date().toISOString().replace(/[:.]/g, "-")}.depthfield`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    showNotice(`Exported ${formatBytes(blob.size)} of ${instrument.symbol} depth history.`);
+  } catch (error) {
+    showNotice(error instanceof Error ? error.message : String(error), true);
+  } finally {
+    exportHistoryButton.disabled = false;
+  }
+}
+
+async function importHistory(): Promise<void> {
+  const file = historyFileInput.files?.[0];
+  historyFileInput.value = "";
+  if (!file) return;
+  importHistoryButton.disabled = true;
+  setHistoryStatus("IMPORTING HISTORY", file.name);
+  try {
+    await historyRecorder.flush();
+    const imported = await historyStore.importRecording(file);
+    const sameMarket = imported.symbol === instrument.symbol && Math.abs(imported.tickSize - instrument.tickSize) < 1e-10;
+    showNotice(`Imported ${imported.symbol} recording with ${imported.chunks} history chunks.`);
+    if (sameMarket) await applyAggregation(instrument.tickSize);
+    else await refreshHistoryStatus();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    setHistoryStatus("IMPORT FAILED", message, true);
+    showNotice(message, true);
+  } finally {
+    importHistoryButton.disabled = false;
+  }
+}
+
+async function refreshHistoryStatus(): Promise<void> {
+  if (!historyStore.available) {
+    setHistoryStatus("LOCAL HISTORY UNAVAILABLE", "IndexedDB is disabled in this browser", true);
+    return;
+  }
+  const stats = await historyStore.stats(instrument.symbol, instrument.tickSize);
+  const state = recordingLive ? "RECORDING" : stats.samples > 0 ? "LOCAL HISTORY" : "LOCAL HISTORY READY";
+  const summary = stats.samples > 0
+    ? `${state} · ${formatDuration(Math.max(0, stats.endTime - stats.startTime))} · ${formatBytes(stats.bytes)}`
+    : state;
+  setHistoryStatus(summary, "Stored only in this browser. Export a portable .depthfield recording at any time.");
+}
+
+function setHistoryStatus(label: string, detail: string, error = false): void {
+  const status = element("history-status");
+  status.textContent = label;
+  status.title = detail;
+  status.classList.toggle("error", error);
+}
+
+function showNotice(message: string, error = false): void {
+  const notice = element("history-notice");
+  notice.textContent = message;
+  notice.classList.toggle("error", error);
+  notice.classList.add("visible");
+  window.clearTimeout(noticeTimer);
+  noticeTimer = window.setTimeout(() => notice.classList.remove("visible"), 4_500);
+}
+
+function formatDuration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 120) return `${seconds}s`;
+  if (seconds < 7200) return `${Math.round(seconds / 60)}m`;
+  return `${(seconds / 3600).toFixed(seconds < 36_000 ? 1 : 0)}h`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function populateAggregation(next: Instrument): void {

@@ -39,6 +39,8 @@ Depthfield is built as a transparent, clean-room implementation that anyone can 
 | Price aggregation | One setting shared by the heatmap, price axis, and order-book ladder |
 | Stable intensity | Slowly adapting percentile normalization and a visible liquidity scale |
 | Long-range correctness | Per-column price anchors preserve history when the live book recenters |
+| Persistent local history | Multi-resolution IndexedDB recording restores the heatmap after a refresh |
+| Portable recordings | Export and import compact `.depthfield` files directly in the browser |
 
 The exchange depth source currently delivers changes at **100 ms**. Depthfield records those real states on a **50 Hz display timeline** while best bid/ask and raw trades arrive in real time. Repeated display samples represent an unchanged book—they are not invented orders.
 
@@ -80,6 +82,22 @@ If Binance public endpoints are unavailable in your region or network, Depthfiel
 | Select a time window | **5S**, **30S**, **2M**, or **15M** |
 | Change price buckets | **AGG** selector |
 | Freeze incoming updates | **PAUSE** |
+| Save a portable recording | **EXPORT** |
+| Restore a recording | **IMPORT** |
+
+## Local history and recordings
+
+Depthfield continuously records the live heatmap into IndexedDB after the Binance snapshot is synchronized. The recorder keeps three bounded resolutions so short-range detail remains dense while longer sessions stay compact:
+
+| Resolution | Local retention | GPU-visible window |
+| --- | ---: | ---: |
+| 20 ms display states | 2 minutes | about 82 seconds |
+| 200 ms states | 30 minutes | about 14 minutes |
+| 1 s states | 24 hours | about 68 minutes |
+
+Refresh the page and the most recent continuous timeline is restored before the live socket starts. Time spent with the page closed is represented as an empty gap rather than invented liquidity. Each market and aggregation setting has an independent recording.
+
+**EXPORT** downloads the retained data as a compact binary `.depthfield` file. **IMPORT** validates and merges a recording without replacing newer local chunks. These files contain the sampled heatmap states and execution aggregates needed by the visualization; they are not raw exchange-message archives.
 
 ## How it works
 
@@ -112,8 +130,9 @@ Important source boundaries:
 
 ## Data and limitations
 
-- History begins when the page connects. Binance's public API does not provide historical order-book depth from before the session.
-- Browser history currently lives in memory and is cleared by a refresh or instrument/aggregation change.
+- History begins when a browser first connects. Binance's public API does not provide historical Spot order-book depth from before that point.
+- Recent history persists in IndexedDB and is isolated by instrument and aggregation. Browser storage can still be removed by the user or privacy controls, so export anything important.
+- The renderer currently displays at most about 68 minutes even though the coarsest local recording is retained for 24 hours.
 - Zoomed-out space before session start remains empty rather than being stretched or fabricated.
 - This project reads public market data only. It does not place or manage orders.
 - Availability, latency, and symbol rules remain subject to the exchange and the user's network.
@@ -144,7 +163,8 @@ open dist/Depthfield.app
 - [x] Direct public Binance Spot data
 - [x] GPU heatmap, live book, multi-resolution zoom, and trade bubbles
 - [x] Static hosting on GitHub Pages and Netlify
-- [ ] IndexedDB recording that survives refreshes
+- [x] IndexedDB recording that survives refreshes
+- [x] Portable browser-native history export/import
 - [ ] Deterministic replay and timeline scrubbing
 - [ ] Reconnect/resume telemetry and captured-feed correctness tests
 - [ ] Coinbase and Kraken adapters
