@@ -1,0 +1,15 @@
+[package]
+name = "depthfield"
+version = "0.1.0"
+edition = "2024"
+description = "A clean-room, GPU-rendered market depth workstation"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.33.3", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+wgpu = { version = "27.0.1", default-features = false, features = ["metal", "parking_lot", "std", "wgsl"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
