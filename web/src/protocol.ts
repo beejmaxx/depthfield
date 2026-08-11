@@ -1,5 +1,8 @@
 export const DEPTH_ROWS = 72;
-export const HISTORY_CAPACITY = 1024;
+export const HISTORY_CAPACITY = 4096;
+export const HISTORY_INTERVAL_MS = 20;
+export const HISTORY_LEVEL_INTERVALS = [20, 200, 1000] as const;
+export const HISTORY_LEVELS = HISTORY_LEVEL_INTERVALS.length;
 export const BOOK_LEVELS = 25;
 export const SNAPSHOT_KIND = 1;
 export const UPDATE_KIND = 2;

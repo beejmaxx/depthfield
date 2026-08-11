@@ -4,6 +4,7 @@ import {
   BOOK_LEVELS,
   COMMIT_HISTORY,
   DEPTH_ROWS,
+  HISTORY_INTERVAL_MS,
   INSTRUMENTS,
   SNAPSHOT_KIND,
   UPDATE_FRAME_BYTES,
@@ -14,8 +15,6 @@ import {
 
 const worker = self as DedicatedWorkerGlobalScope;
 const INITIAL_HISTORY = 720;
-const LIVE_INTERVAL_MS = 32;
-const COMMIT_EVERY = 3;
 const BINANCE_STREAM = "wss://data-stream.binance.vision/stream";
 const BINANCE_REST = "https://data-api.binance.vision/api/v3/depth";
 
@@ -35,11 +34,20 @@ interface BinanceDepthEvent {
 }
 
 interface BinanceTradeEvent {
-  e: "aggTrade";
+  e: "trade";
   E: number;
   p: string;
   q: string;
   m: boolean;
+}
+
+interface BinanceBookTickerEvent {
+  u: number;
+  s: string;
+  b: string;
+  B: string;
+  a: string;
+  A: string;
 }
 
 interface BinanceSnapshot {
@@ -107,7 +115,7 @@ class MarketSimulation {
 
   nextUpdate(): ArrayBuffer {
     this.tickCounter += 1;
-    const commit = this.tickCounter % COMMIT_EVERY === 0;
+    const commit = true;
     const trade = this.advance(commit);
     return encodeUpdate({
       commit,
@@ -225,7 +233,7 @@ class BinanceFeed {
   start(): void {
     postStatus("connecting", "BINANCE PUBLIC", "Direct public market-data connection");
     const symbol = this.instrument.symbol.toLowerCase();
-    const streams = `${symbol}@depth@100ms/${symbol}@aggTrade`;
+    const streams = `${symbol}@depth@100ms/${symbol}@bookTicker/${symbol}@trade`;
     this.socket = new WebSocket(`${BINANCE_STREAM}?streams=${streams}`);
     this.connectTimer = worker.setTimeout(() => this.fail("Connection timed out"), 8_000);
     this.socket.onopen = () => {
@@ -247,10 +255,13 @@ class BinanceFeed {
   }
 
   private onMessage(raw: string): void {
-    const wrapper = JSON.parse(raw) as { data?: BinanceDepthEvent | BinanceTradeEvent };
+    const wrapper = JSON.parse(raw) as {
+      stream?: string;
+      data?: BinanceDepthEvent | BinanceTradeEvent | BinanceBookTickerEvent;
+    };
     const data = wrapper.data;
     if (!data) return;
-    if (data.e === "aggTrade") {
+    if (wrapper.stream?.endsWith("@trade") && "e" in data && data.e === "trade") {
       const price = Number(data.p);
       const size = Number(data.q);
       const side = data.m ? -1 : 1;
@@ -262,6 +273,16 @@ class BinanceFeed {
       this.latestEventTime = data.E;
       return;
     }
+    if (wrapper.stream?.endsWith("@bookTicker") && "b" in data && typeof data.b === "string") {
+      const bid = Number(data.b);
+      const ask = Number(data.a);
+      if (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > bid) {
+        this.midPrice = (bid + ask) * 0.5;
+        this.latestEventTime = Date.now();
+      }
+      return;
+    }
+    if (!("e" in data) || data.e !== "depthUpdate") return;
     if (!this.ready) {
       this.bufferedDepth.push(data);
       if (this.bufferedDepth.length > 2_000) this.bufferedDepth.shift();
@@ -301,8 +322,8 @@ class BinanceFeed {
       if (this.connectTimer !== undefined) clearTimeout(this.connectTimer);
       this.rebuildNormalizedBook();
       postBuffer(encodeSnapshot(new Float32Array(0), new Float32Array(0), 0));
-      this.emitTimer = worker.setInterval(() => this.emit(), LIVE_INTERVAL_MS);
-      postStatus("live", "BINANCE PUBLIC", "Real-time public spot order book — no API key");
+      this.emitTimer = worker.setInterval(() => this.emit(), HISTORY_INTERVAL_MS);
+      postStatus("live", "BINANCE PUBLIC", "100 ms depth + real-time BBO/trades on a 50 Hz timeline");
     } catch (error) {
       this.fail(error instanceof Error ? error.message : "Snapshot synchronization failed");
     }
@@ -354,10 +375,11 @@ class BinanceFeed {
         this.liquidity[row] = 0.018 + Math.pow(normalized, 2.4) * 0.982;
       }
     }
-    const topBids = bids.slice(0, 12);
-    const topAsks = asks.slice(0, 12).reverse();
+    const topBids = aggregateBookLevels(bids, this.instrument.tickSize, "bid", 12);
+    const topAsks = aggregateBookLevels(asks, this.instrument.tickSize, "ask", 12);
+    const displayAsks = [...topAsks].reverse();
     this.book.fill(0);
-    topAsks.forEach(([price, size], index) => setBookLevel(this.book, index, price, 0, size));
+    displayAsks.forEach(([price, size], index) => setBookLevel(this.book, index, price, 0, size));
     setBookLevel(this.book, 12, this.midPrice, 0, 0);
     topBids.forEach(([price, size], index) => setBookLevel(this.book, 13 + index, price, size, 0));
     const bidDepth = topBids.reduce((total, level) => total + level[1], 0);
@@ -369,7 +391,7 @@ class BinanceFeed {
     if (paused || !this.ready || this.generation !== activeGeneration) return;
     this.sequence += 1;
     this.tickCounter += 1;
-    const commit = this.tickCounter % COMMIT_EVERY === 0;
+    const commit = true;
     postBuffer(encodeUpdate({
       commit,
       sequence: this.sequence,
@@ -440,7 +462,7 @@ function startSimulation(instrument: Instrument, generation: number, announce: b
   simulationTimer = worker.setInterval(() => {
     if (paused || generation !== activeGeneration || !simulation) return;
     postBuffer(simulation.nextUpdate());
-  }, LIVE_INTERVAL_MS);
+  }, HISTORY_INTERVAL_MS);
 }
 
 function stopActiveSource(): void {
@@ -517,6 +539,25 @@ function applyLevels(target: Map<number, number>, levels: Array<[string, string]
 function addToBucket(sizes: Float64Array, price: number, size: number, anchor: number, tick: number): void {
   const row = Math.round(DEPTH_ROWS / 2 - (price - anchor) / tick);
   if (row >= 0 && row < DEPTH_ROWS) sizes[row] += size;
+}
+
+function aggregateBookLevels(
+  levels: Array<[number, number]>,
+  tick: number,
+  side: "bid" | "ask",
+  limit: number,
+): Array<[number, number]> {
+  const buckets = new Map<number, number>();
+  for (const [price, size] of levels) {
+    const bucketIndex = side === "bid"
+      ? Math.floor(price / tick + 1e-8)
+      : Math.ceil(price / tick - 1e-8);
+    const bucketPrice = bucketIndex * tick;
+    buckets.set(bucketPrice, (buckets.get(bucketPrice) ?? 0) + size);
+  }
+  return [...buckets.entries()]
+    .sort((left, right) => side === "bid" ? right[0] - left[0] : left[0] - right[0])
+    .slice(0, limit);
 }
 
 function setBookLevel(book: Float32Array, index: number, price: number, bid: number, ask: number): void {

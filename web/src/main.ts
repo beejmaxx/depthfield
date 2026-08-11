@@ -8,7 +8,13 @@ import {
   decodeFrame,
   formatPrice,
 } from "./protocol";
-import { HeatmapRenderer, type BookLevel, type ViewState } from "./renderer";
+import {
+  HeatmapRenderer,
+  TIME_ZOOM_MAX,
+  TIME_ZOOM_MIN,
+  type BookLevel,
+  type ViewState,
+} from "./renderer";
 
 interface WorkerStatus {
   type: "status";
@@ -101,7 +107,7 @@ function installControls(): void {
   }
   contrastInput.addEventListener("input", () => renderer.setView({ contrast: contrastInput.valueAsNumber }));
   priceZoomInput.addEventListener("input", () => renderer.setView({ priceZoom: priceZoomInput.valueAsNumber }));
-  timeZoomInput.addEventListener("input", () => renderer.setView({ timeZoom: timeZoomInput.valueAsNumber }));
+  timeZoomInput.addEventListener("input", () => renderer.setView({ timeZoom: sliderToTimeZoom(timeZoomInput.valueAsNumber) }));
   element<HTMLButtonElement>("reset").addEventListener("click", () => {
     renderer.setView({ contrast: 1.08, priceZoom: 1, timeZoom: 2.5 }, true);
   });
@@ -131,7 +137,15 @@ function selectInstrument(next: Instrument): void {
 function syncViewControls(view: ViewState): void {
   contrastInput.value = view.contrast.toString();
   priceZoomInput.value = view.priceZoom.toString();
-  timeZoomInput.value = view.timeZoom.toString();
+  timeZoomInput.value = timeZoomToSlider(view.timeZoom).toString();
+}
+
+function sliderToTimeZoom(value: number): number {
+  return TIME_ZOOM_MIN * Math.pow(TIME_ZOOM_MAX / TIME_ZOOM_MIN, value / 100);
+}
+
+function timeZoomToSlider(value: number): number {
+  return 100 * Math.log(value / TIME_ZOOM_MIN) / Math.log(TIME_ZOOM_MAX / TIME_ZOOM_MIN);
 }
 
 function updateMetrics(frame: UpdateFrame): void {

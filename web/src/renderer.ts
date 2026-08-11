@@ -1,6 +1,9 @@
 import {
   DEPTH_ROWS,
   HISTORY_CAPACITY,
+  HISTORY_INTERVAL_MS,
+  HISTORY_LEVEL_INTERVALS,
+  HISTORY_LEVELS,
   type Instrument,
   type SnapshotFrame,
   type UpdateFrame,
@@ -11,6 +14,8 @@ const PACKED_ROWS = DEPTH_ROWS / 4;
 const TIME_AXIS_HEIGHT = 22;
 const PRICE_AXIS_WIDTH = 78;
 const LIVE_BOOK_WIDTH = 92;
+export const TIME_ZOOM_MIN = 0.02;
+export const TIME_ZOOM_MAX = 16;
 
 const shader = /* wgsl */ `
 struct Uniforms {
@@ -42,7 +47,8 @@ fn unpack_depth(texel: vec4<f32>, channel: i32) -> f32 {
 }
 
 fn history_depth(column: i32, row: i32) -> f32 {
-  let packed_row = row / 4;
+  let level = i32(uniforms.view.z);
+  let packed_row = row / 4 + level * (i32(uniforms.market.w) / 4);
   let channel = row - packed_row * 4;
   return unpack_depth(textureLoad(history_texture, vec2<i32>(column, packed_row), 0), channel);
 }
@@ -101,13 +107,18 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
       if (count > 0) {
         let head = i32(uniforms.history.y);
         let capacity = i32(uniforms.history.z);
-        let visible = max(1, min(count, i32(floor(f32(count) / uniforms.view.y))));
+        let window = max(1, i32(floor(f32(capacity) / uniforms.view.y)));
+        let visible = min(count, window);
         let skipped = max(0, count - visible);
-        let logical = skipped + min(visible - 1, i32(floor((uv.x / history_end) * f32(visible))));
-        let oldest = (head + capacity - count) % capacity;
-        let physical = (oldest + logical) % capacity;
-        raw = history_depth(physical, row);
-        age = 0.72 + 0.28 * f32(logical - skipped) / max(1.0, f32(visible - 1));
+        let padding = window - visible;
+        let window_column = min(window - 1, i32(floor((uv.x / history_end) * f32(window))));
+        if (window_column >= padding) {
+          let logical = skipped + window_column - padding;
+          let oldest = (head + capacity - count) % capacity;
+          let physical = (oldest + logical) % capacity;
+          raw = history_depth(physical, row);
+          age = 0.72 + 0.28 * f32(window_column - padding) / max(1.0, f32(visible - 1));
+        }
       }
     } else {
       raw = live_depth(row);
@@ -149,6 +160,16 @@ export interface BookLevel {
   ask: number;
 }
 
+interface HistoryView {
+  level: number;
+  sampleMs: number;
+  count: number;
+  head: number;
+  windowCount: number;
+  shaderScale: number;
+  spanSeconds: number;
+}
+
 export class HeatmapRenderer {
   readonly canvas: HTMLCanvasElement;
   readonly overlay: HTMLCanvasElement;
@@ -160,12 +181,16 @@ export class HeatmapRenderer {
   readonly uniformBuffer: GPUBuffer;
   readonly bindGroup: GPUBindGroup;
   readonly pipeline: GPURenderPipeline;
-  readonly midPrices = new Float32Array(HISTORY_CAPACITY);
+  readonly midPrices = Array.from(
+    { length: HISTORY_LEVELS },
+    () => new Float32Array(HISTORY_CAPACITY),
+  );
   readonly liveLiquidity = new Float32Array(DEPTH_ROWS);
   instrument: Instrument;
   view: ViewState = { contrast: 1.08, priceZoom: 1, timeZoom: 2.5 };
-  historyCount = 0;
-  historyHead = 0;
+  readonly historyCounts = new Uint32Array(HISTORY_LEVELS);
+  readonly historyHeads = new Uint32Array(HISTORY_LEVELS);
+  historyCommitCount = 0;
   midPrice: number;
   anchorPrice: number;
   pointer: { x: number; y: number } | null = null;
@@ -211,7 +236,7 @@ export class HeatmapRenderer {
 
     this.historyTexture = device.createTexture({
       label: "circular-liquidity-history",
-      size: [HISTORY_CAPACITY, PACKED_ROWS],
+      size: [HISTORY_CAPACITY, PACKED_ROWS * HISTORY_LEVELS],
       format: "rgba8unorm",
       usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     });
@@ -260,42 +285,50 @@ export class HeatmapRenderer {
     this.instrument = instrument;
     this.midPrice = instrument.basePrice;
     this.anchorPrice = instrument.basePrice;
-    this.historyCount = 0;
-    this.historyHead = 0;
-    this.midPrices.fill(0);
+    this.historyCounts.fill(0);
+    this.historyHeads.fill(0);
+    this.historyCommitCount = 0;
+    for (const prices of this.midPrices) prices.fill(0);
   }
 
   setView(next: Partial<ViewState>, notify = false): void {
     this.view = {
       contrast: clamp(next.contrast ?? this.view.contrast, 0.55, 1.8),
       priceZoom: clamp(next.priceZoom ?? this.view.priceZoom, 1, 3),
-      timeZoom: clamp(next.timeZoom ?? this.view.timeZoom, 1, 16),
+      timeZoom: clamp(next.timeZoom ?? this.view.timeZoom, TIME_ZOOM_MIN, TIME_ZOOM_MAX),
     };
     if (notify) this.onViewChange?.({ ...this.view });
   }
 
   uploadSnapshot(frame: SnapshotFrame): void {
-    const count = Math.min(frame.count, HISTORY_CAPACITY);
-    const sourceStart = frame.count - count;
-    const packed = new Uint8Array(HISTORY_CAPACITY * PACKED_ROWS * 4);
-    for (let column = 0; column < count; column += 1) {
-      const sourceColumn = sourceStart + column;
-      this.midPrices[column] = frame.midPrices[sourceColumn];
-      for (let row = 0; row < DEPTH_ROWS; row += 1) {
-        const packedRow = Math.floor(row / 4);
-        const channel = row % 4;
-        const target = (packedRow * HISTORY_CAPACITY + column) * 4 + channel;
-        packed[target] = quantize(frame.columns[sourceColumn * DEPTH_ROWS + row]);
+    const packed = new Uint8Array(HISTORY_CAPACITY * PACKED_ROWS * HISTORY_LEVELS * 4);
+    this.historyCounts.fill(0);
+    this.historyHeads.fill(0);
+    this.historyCommitCount = 0;
+    for (let level = 0; level < HISTORY_LEVELS; level += 1) {
+      const stride = HISTORY_LEVEL_INTERVALS[level] / HISTORY_INTERVAL_MS;
+      const available = Math.ceil(frame.count / stride);
+      const count = Math.min(available, HISTORY_CAPACITY);
+      const sourceStart = Math.max(0, frame.count - count * stride);
+      for (let column = 0; column < count; column += 1) {
+        const sourceColumn = Math.min(frame.count - 1, sourceStart + (column + 1) * stride - 1);
+        this.midPrices[level][column] = frame.midPrices[sourceColumn];
+        for (let row = 0; row < DEPTH_ROWS; row += 1) {
+          const packedRow = level * PACKED_ROWS + Math.floor(row / 4);
+          const channel = row % 4;
+          const target = (packedRow * HISTORY_CAPACITY + column) * 4 + channel;
+          packed[target] = quantize(frame.columns[sourceColumn * DEPTH_ROWS + row]);
+        }
       }
+      this.historyCounts[level] = count;
+      this.historyHeads[level] = count % HISTORY_CAPACITY;
     }
     this.device.queue.writeTexture(
       { texture: this.historyTexture },
       packed,
-      { bytesPerRow: HISTORY_CAPACITY * 4, rowsPerImage: PACKED_ROWS },
-      [HISTORY_CAPACITY, PACKED_ROWS],
+      { bytesPerRow: HISTORY_CAPACITY * 4, rowsPerImage: PACKED_ROWS * HISTORY_LEVELS },
+      [HISTORY_CAPACITY, PACKED_ROWS * HISTORY_LEVELS],
     );
-    this.historyCount = count;
-    this.historyHead = count % HISTORY_CAPACITY;
     this.midPrice = frame.midPrices[frame.count - 1] ?? this.instrument.basePrice;
   }
 
@@ -311,15 +344,21 @@ export class HeatmapRenderer {
       [1, PACKED_ROWS],
     );
     if (!frame.commit) return;
-    this.device.queue.writeTexture(
-      { texture: this.historyTexture, origin: [this.historyHead, 0] },
-      packed,
-      { bytesPerRow: 4, rowsPerImage: PACKED_ROWS },
-      [1, PACKED_ROWS],
-    );
-    this.midPrices[this.historyHead] = frame.midPrice;
-    this.historyHead = (this.historyHead + 1) % HISTORY_CAPACITY;
-    this.historyCount = Math.min(HISTORY_CAPACITY, this.historyCount + 1);
+    this.historyCommitCount += 1;
+    for (let level = 0; level < HISTORY_LEVELS; level += 1) {
+      const stride = HISTORY_LEVEL_INTERVALS[level] / HISTORY_INTERVAL_MS;
+      if (level > 0 && this.historyCommitCount % stride !== 0) continue;
+      const head = this.historyHeads[level];
+      this.device.queue.writeTexture(
+        { texture: this.historyTexture, origin: [head, level * PACKED_ROWS] },
+        packed,
+        { bytesPerRow: 4, rowsPerImage: PACKED_ROWS },
+        [1, PACKED_ROWS],
+      );
+      this.midPrices[level][head] = frame.midPrice;
+      this.historyHeads[level] = (head + 1) % HISTORY_CAPACITY;
+      this.historyCounts[level] = Math.min(HISTORY_CAPACITY, this.historyCounts[level] + 1);
+    }
   }
 
   getBook(levelCount = 25): BookLevel[] {
@@ -386,21 +425,22 @@ export class HeatmapRenderer {
     const plotFraction = plotWidth / this.width;
     const plotBottom = Math.max(0.5, (this.height - TIME_AXIS_HEIGHT) / this.height);
     const visibleRows = clamp(58 / Math.sqrt(this.view.priceZoom), 24, DEPTH_ROWS);
+    const history = this.getHistoryView();
     const uniforms = new Float32Array([
       pixelWidth,
       pixelHeight,
       historyFraction,
       plotFraction,
       this.view.contrast,
-      this.view.timeZoom,
-      this.view.priceZoom,
+      history.shaderScale,
+      history.level,
       visibleRows,
       this.midPrice,
       this.anchorPrice,
       this.instrument.tickSize,
       DEPTH_ROWS,
-      this.historyCount,
-      this.historyHead,
+      history.count,
+      history.head,
       HISTORY_CAPACITY,
       plotBottom,
     ]);
@@ -442,12 +482,14 @@ export class HeatmapRenderer {
     context.fillStyle = "#24d0ab";
     context.fillText("LIVE BOOK", historyWidth + 7, 13);
 
-    const visibleCount = Math.max(1, Math.min(this.historyCount, Math.floor(this.historyCount / this.view.timeZoom)));
-    const skipped = Math.max(0, this.historyCount - visibleCount);
-    const oldest = (this.historyHead + HISTORY_CAPACITY - this.historyCount) % HISTORY_CAPACITY;
+    const history = this.getHistoryView();
+    const visibleCount = Math.min(history.count, history.windowCount);
+    const skipped = Math.max(0, history.count - visibleCount);
+    const leftPadding = Math.max(0, history.windowCount - visibleCount);
+    const oldest = (history.head + HISTORY_CAPACITY - history.count) % HISTORY_CAPACITY;
     const priceToY = (price: number) =>
       plotHeight * 0.5 - ((price - this.midPrice) / this.instrument.tickSize) * (plotHeight / visibleRows);
-    const candleSpan = Math.max(2, Math.round(visibleCount / Math.max(30, historyWidth / 8)));
+    const candleSpan = Math.max(2, Math.round(history.windowCount / Math.max(30, historyWidth / 8)));
 
     context.lineWidth = 1;
     for (let start = 0; start < visibleCount; start += candleSpan) {
@@ -458,15 +500,15 @@ export class HeatmapRenderer {
       let low = Number.POSITIVE_INFINITY;
       for (let offset = start; offset < end; offset += 1) {
         const physical = (oldest + skipped + offset) % HISTORY_CAPACITY;
-        const price = this.midPrices[physical];
+        const price = this.midPrices[history.level][physical];
         if (offset === start) open = price;
         close = price;
         high = Math.max(high, price);
         low = Math.min(low, price);
       }
       if (!Number.isFinite(high) || open === 0) continue;
-      const x = ((start + (end - start) * 0.5) / visibleCount) * historyWidth;
-      const candleWidth = Math.max(3, ((end - start) / visibleCount) * historyWidth * 0.72);
+      const x = ((leftPadding + start + (end - start) * 0.5) / history.windowCount) * historyWidth;
+      const candleWidth = Math.max(2, ((end - start) / history.windowCount) * historyWidth * 0.72);
       const openY = priceToY(open);
       const closeY = priceToY(close);
       const highY = priceToY(high + this.instrument.tickSize * 0.55);
@@ -518,9 +560,8 @@ export class HeatmapRenderer {
     context.font = "8px ui-monospace, SFMono-Regular, Menlo, monospace";
     context.fillStyle = "#526b70";
     context.textAlign = "center";
-    const spanSeconds = visibleCount * 0.096;
     for (const fraction of [0.2, 0.4, 0.6, 0.8]) {
-      context.fillText(`-${Math.round((1 - fraction) * spanSeconds)}s`, historyWidth * fraction, plotHeight + 11);
+      context.fillText(`-${formatLookback((1 - fraction) * history.spanSeconds)}`, historyWidth * fraction, plotHeight + 11);
     }
     context.textAlign = "right";
     context.fillStyle = "#24d0ab";
@@ -546,6 +587,40 @@ export class HeatmapRenderer {
       context.fillText(formatPrice(pointerPrice, this.instrument), plotWidth + PRICE_AXIS_WIDTH / 2, this.pointer.y);
     }
   }
+
+  private getHistoryView(): HistoryView {
+    const highResolutionSpan = (HISTORY_CAPACITY * HISTORY_INTERVAL_MS) / 1000;
+    const requestedSpan = highResolutionSpan / this.view.timeZoom;
+    let level = 0;
+    for (let candidate = 1; candidate < HISTORY_LEVELS; candidate += 1) {
+      const previousCapacity = (HISTORY_CAPACITY * HISTORY_LEVEL_INTERVALS[candidate - 1]) / 1000;
+      if (requestedSpan > previousCapacity) level = candidate;
+    }
+    const sampleMs = HISTORY_LEVEL_INTERVALS[level];
+    const windowCount = clampInt(Math.ceil((requestedSpan * 1000) / sampleMs), 1, HISTORY_CAPACITY);
+    return {
+      level,
+      sampleMs,
+      count: this.historyCounts[level],
+      head: this.historyHeads[level],
+      windowCount,
+      shaderScale: HISTORY_CAPACITY / windowCount,
+      spanSeconds: (windowCount * sampleMs) / 1000,
+    };
+  }
+}
+
+function formatLookback(seconds: number): string {
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  if (seconds < 120) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) {
+    const minutes = Math.floor(seconds / 60);
+    const remainder = Math.round(seconds % 60);
+    return `${minutes}:${remainder.toString().padStart(2, "0")}`;
+  }
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.round((seconds % 3600) / 60);
+  return `${hours}:${minutes.toString().padStart(2, "0")}`;
 }
 
 function packColumn(liquidity: Float32Array): Uint8Array<ArrayBuffer> {

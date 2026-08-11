@@ -14,13 +14,13 @@ The web application connects directly from its worker to Binance's public spot m
 The browser client is intentionally not an egui-to-WASM port. Its hot path is designed for the web:
 
 - direct WebGPU heatmap rendering with one full-screen draw
-- a 1,024-column circular GPU texture, so historical pixels are never shifted
+- a three-level, 4,096-column circular GPU history pyramid, so historical pixels are never shifted
 - immutable committed history and a separately updated live-book texture
 - binary transferable worker messages rather than JSON market events
 - market simulation and decoding off the main UI thread
 - a correctly sequenced Binance snapshot-plus-diff order book
-- real aggregate trades, volume, delta, imbalance, and order-book quantities
-- batched history commits at roughly 10 Hz with live-book changes around 30 Hz
+- raw trades plus real-time best-bid/ask, volume, delta, imbalance, and aggregated order-book quantities
+- a 50 Hz recent timeline with 200 ms and 1 s archive levels for smooth zoom from about 5 seconds to 68 minutes
 - shader-side colour mapping, contrast, time zoom, and price zoom
 - DOM UI outside the chart, keeping the chart renderer independent
 
@@ -34,7 +34,7 @@ npm run dev
 
 Then open `http://127.0.0.1:5173`. A current WebGPU-capable browser and hardware acceleration are required.
 
-The live heatmap begins accumulating depth history when the page connects. Binance's public API provides the current order book and subsequent changes, not historical depth from before the session.
+The live heatmap begins accumulating depth history when the page connects. Zoomed-out windows remain empty before the session start instead of stretching or inventing data. Binance's public API provides the current order book and subsequent changes, not historical depth from before the session.
 
 Create an optimized build:
 
