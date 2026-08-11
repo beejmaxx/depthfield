@@ -1,8 +1,10 @@
 export const DEPTH_ROWS = 72;
 export const HISTORY_CAPACITY = 1024;
+export const BOOK_LEVELS = 25;
 export const SNAPSHOT_KIND = 1;
 export const UPDATE_KIND = 2;
 export const UPDATE_HEADER_BYTES = 56;
+export const UPDATE_FRAME_BYTES = UPDATE_HEADER_BYTES + DEPTH_ROWS * 4 + BOOK_LEVELS * 3 * 4;
 export const COMMIT_HISTORY = 1;
 
 export interface Instrument {
@@ -19,24 +21,24 @@ export const INSTRUMENTS: readonly Instrument[] = [
     symbol: "BTCUSDT",
     venue: "BINANCE",
     name: "Bitcoin / Tether",
-    basePrice: 118_432.5,
-    tickSize: 0.5,
+    basePrice: 64_000,
+    tickSize: 1,
     decimals: 1,
   },
   {
     symbol: "ETHUSDT",
     venue: "BINANCE",
     name: "Ether / Tether",
-    basePrice: 4_218.32,
-    tickSize: 0.05,
+    basePrice: 3_500,
+    tickSize: 0.1,
     decimals: 2,
   },
   {
-    symbol: "ESU6",
-    venue: "CME",
-    name: "E-mini S&P 500",
-    basePrice: 6_412.75,
-    tickSize: 0.25,
+    symbol: "SOLUSDT",
+    venue: "BINANCE",
+    name: "Solana / Tether",
+    basePrice: 150,
+    tickSize: 0.01,
     decimals: 2,
   },
 ] as const;
@@ -60,8 +62,10 @@ export interface UpdateFrame {
   tradePrice: number;
   tradeSize: number;
   tradeSide: number;
+  anchorPrice: number;
   generatedAt: number;
   liquidity: Float32Array;
+  book: Float32Array;
 }
 
 export type MarketFrame = SnapshotFrame | UpdateFrame;
@@ -92,8 +96,10 @@ export function decodeFrame(buffer: ArrayBuffer): MarketFrame {
       tradePrice: view.getFloat32(32, true),
       tradeSize: view.getFloat32(36, true),
       tradeSide: view.getFloat32(40, true),
+      anchorPrice: view.getFloat32(44, true),
       generatedAt: view.getFloat64(48, true),
       liquidity: new Float32Array(buffer, UPDATE_HEADER_BYTES, rows),
+      book: new Float32Array(buffer, UPDATE_HEADER_BYTES + rows * 4, BOOK_LEVELS * 3),
     };
   }
   throw new Error(`Unknown market frame: ${kind}`);

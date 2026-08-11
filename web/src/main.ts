@@ -8,7 +8,14 @@ import {
   decodeFrame,
   formatPrice,
 } from "./protocol";
-import { HeatmapRenderer, type ViewState } from "./renderer";
+import { HeatmapRenderer, type BookLevel, type ViewState } from "./renderer";
+
+interface WorkerStatus {
+  type: "status";
+  state: string;
+  label: string;
+  detail: string;
+}
 
 const canvas = element<HTMLCanvasElement>("heatmap");
 const overlay = element<HTMLCanvasElement>("overlay");
@@ -27,6 +34,7 @@ let paused = false;
 let updateCount = 0;
 let rateWindowStart = performance.now();
 let lastBookUpdate = 0;
+let connectionLabel = "CONNECTING";
 const bookRows = createBookRows();
 
 try {
@@ -43,7 +51,19 @@ try {
   throw error;
 }
 
-worker.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+worker.onmessage = (event: MessageEvent<ArrayBuffer | WorkerStatus>) => {
+  if (!(event.data instanceof ArrayBuffer)) {
+    connectionLabel = event.data.label;
+    text("connection-label", paused ? "PAUSED" : event.data.label);
+    const sourceStatus = event.data.state === "live"
+      ? "LIVE BINANCE SPOT · NO API KEY"
+      : event.data.state === "fallback"
+        ? "LOCAL FALLBACK ACTIVE"
+        : event.data.label;
+    text("source-status", sourceStatus);
+    element("connection-label").title = event.data.detail;
+    return;
+  }
   const frame = decodeFrame(event.data);
   if (frame.kind === SNAPSHOT_KIND) {
     renderer.uploadSnapshot(frame);
@@ -54,7 +74,7 @@ worker.onmessage = (event: MessageEvent<ArrayBuffer>) => {
   updateCount += 1;
   const now = performance.now();
   if (now - lastBookUpdate >= 80) {
-    updateBook();
+    updateBook(decodeBook(frame.book));
     lastBookUpdate = now;
   }
   if (now - rateWindowStart >= 1000) {
@@ -90,7 +110,7 @@ function installControls(): void {
     renderer.paused = paused;
     pauseButton.innerHTML = paused ? "▶&nbsp; RESUME" : "Ⅱ&nbsp; PAUSE";
     worker.postMessage({ type: paused ? "pause" : "resume" });
-    text("connection-label", paused ? "PAUSED" : "SIMULATION");
+    text("connection-label", paused ? "PAUSED" : connectionLabel);
   });
   restartButton.addEventListener("click", () => worker.postMessage({ type: "restart", symbol: instrument.symbol }));
 }
@@ -135,8 +155,7 @@ function createBookRows(): HTMLDivElement[] {
   return rows;
 }
 
-function updateBook(): void {
-  const levels = renderer.getBook(bookRows.length);
+function updateBook(levels: BookLevel[]): void {
   const maximum = Math.max(1, ...levels.flatMap((level) => [level.bid, level.ask]));
   let bidTotal = 0;
   let askTotal = 0;
@@ -154,6 +173,15 @@ function updateBook(): void {
   });
   text("bid-depth", bidTotal.toFixed(1));
   text("ask-depth", askTotal.toFixed(1));
+}
+
+function decodeBook(encoded: Float32Array): BookLevel[] {
+  const levels: BookLevel[] = [];
+  for (let index = 0; index < bookRows.length; index += 1) {
+    const offset = index * 3;
+    levels.push({ price: encoded[offset], bid: encoded[offset + 1], ask: encoded[offset + 2] });
+  }
+  return levels;
 }
 
 function element<T extends HTMLElement>(id: string): T {

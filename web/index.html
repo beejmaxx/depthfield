@@ -11,7 +11,7 @@
       <header class="topbar">
         <div class="brand"><span class="brand-mark">◆</span><b>DEPTHFIELD</b><small>WEBGPU</small></div>
         <nav id="symbols" aria-label="Instrument"></nav>
-        <div class="connection"><span class="pulse"></span><span id="connection-label">SIMULATION</span><span id="latency">— ms</span></div>
+        <div class="connection"><span class="pulse"></span><span id="connection-label">CONNECTING</span><span id="latency">— ms</span></div>
       </header>
 
       <section class="instrument-bar">
@@ -52,11 +52,11 @@
       </main>
 
       <footer>
-        <span class="live-status"><span class="pulse"></span> LIVE SIMULATION</span>
+        <span class="live-status"><span class="pulse"></span> <span id="source-status">CONNECTING TO BINANCE</span></span>
         <button id="pause">Ⅱ&nbsp; PAUSE</button>
         <button id="restart">↶&nbsp; RESTART</button>
         <span id="event-rate">0 updates/s</span>
-        <span class="engine-label">BINARY WORKER → CIRCULAR GPU TEXTURE</span>
+        <span class="engine-label">PUBLIC WEBSOCKET → BINARY WORKER → CIRCULAR GPU TEXTURE</span>
       </footer>
     </div>
     <script type="module" src="/src/main.ts"></script>

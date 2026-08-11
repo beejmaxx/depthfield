@@ -7,7 +7,7 @@ The repository currently contains two working prototypes:
 - a native Rust/egui/wgpu macOS application
 - a dedicated TypeScript/WebGPU browser application
 
-Both currently use deterministic synthetic market data. They are rendering and interaction prototypes, not trading software and not yet connected to an exchange.
+The web application connects directly from its worker to Binance's public spot market-data endpoints by default. It requires no account, API key, or trading credentials. If Binance is unavailable, it automatically switches to the deterministic local simulator. The native application currently uses synthetic data.
 
 ## Web application
 
@@ -18,6 +18,8 @@ The browser client is intentionally not an egui-to-WASM port. Its hot path is de
 - immutable committed history and a separately updated live-book texture
 - binary transferable worker messages rather than JSON market events
 - market simulation and decoding off the main UI thread
+- a correctly sequenced Binance snapshot-plus-diff order book
+- real aggregate trades, volume, delta, imbalance, and order-book quantities
 - batched history commits at roughly 10 Hz with live-book changes around 30 Hz
 - shader-side colour mapping, contrast, time zoom, and price zoom
 - DOM UI outside the chart, keeping the chart renderer independent
@@ -31,6 +33,8 @@ npm run dev
 ```
 
 Then open `http://127.0.0.1:5173`. A current WebGPU-capable browser and hardware acceleration are required.
+
+The live heatmap begins accumulating depth history when the page connects. Binance's public API provides the current order book and subsequent changes, not historical depth from before the session.
 
 Create an optimized build:
 
@@ -84,7 +88,7 @@ Important source boundaries:
 - `src/heatmap.rs` draws the native heatmap with egui's GPU painter.
 - `src/app.rs` owns the native workstation composition.
 - `web/src/protocol.ts` defines the browser's compact binary frame contract.
-- `web/src/market.worker.ts` owns off-main-thread simulated market updates.
+- `web/src/market.worker.ts` owns the direct public Binance connection, snapshot synchronization, sequence validation, aggregation, and simulator fallback off the main thread.
 - `web/src/renderer.ts` owns the circular WebGPU textures and chart rendering.
 - `web/src/main.ts` connects the renderer, worker, and web-native controls.
 
@@ -92,9 +96,9 @@ The development server sends cross-origin-isolation headers so a future Rust/WAS
 
 ## Production roadmap
 
-1. Build a Rust feed service that normalizes exchange snapshots and sequenced deltas.
-2. Replace the simulator transport with a compact binary WebSocket stream.
-3. Add recording, deterministic replay, and gap recovery.
+1. Add recording and deterministic replay so a new session can load genuine historical depth.
+2. Build an optional Rust feed service for multi-venue aggregation and long-lived recording.
+3. Add reconnect-with-resume and deeper operational telemetry around stream gaps.
 4. Move CPU-heavy aggregation into Rust/WASM only where profiling justifies it.
 5. Add GPU-instanced trades, volume, annotations, and order placement overlays.
 6. Validate latency, dropped-frame behavior, and book correctness against captured exchange data.

@@ -98,15 +98,17 @@ fn fragment_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
   if (row >= 0 && row < i32(uniforms.market.w)) {
     if (uv.x < history_end) {
       let count = i32(uniforms.history.x);
-      let head = i32(uniforms.history.y);
-      let capacity = i32(uniforms.history.z);
-      let visible = max(30, min(count, i32(floor(f32(count) / uniforms.view.y))));
-      let skipped = max(0, count - visible);
-      let logical = skipped + min(visible - 1, i32(floor((uv.x / history_end) * f32(visible))));
-      let oldest = (head + capacity - count) % capacity;
-      let physical = (oldest + logical) % capacity;
-      raw = history_depth(physical, row);
-      age = 0.72 + 0.28 * f32(logical - skipped) / max(1.0, f32(visible - 1));
+      if (count > 0) {
+        let head = i32(uniforms.history.y);
+        let capacity = i32(uniforms.history.z);
+        let visible = max(1, min(count, i32(floor(f32(count) / uniforms.view.y))));
+        let skipped = max(0, count - visible);
+        let logical = skipped + min(visible - 1, i32(floor((uv.x / history_end) * f32(visible))));
+        let oldest = (head + capacity - count) % capacity;
+        let physical = (oldest + logical) % capacity;
+        raw = history_depth(physical, row);
+        age = 0.72 + 0.28 * f32(logical - skipped) / max(1.0, f32(visible - 1));
+      }
     } else {
       raw = live_depth(row);
     }
@@ -165,6 +167,7 @@ export class HeatmapRenderer {
   historyCount = 0;
   historyHead = 0;
   midPrice: number;
+  anchorPrice: number;
   pointer: { x: number; y: number } | null = null;
   paused = false;
   onViewChange?: (view: ViewState) => void;
@@ -198,6 +201,7 @@ export class HeatmapRenderer {
     this.overlay = overlay;
     this.instrument = instrument;
     this.midPrice = instrument.basePrice;
+    this.anchorPrice = instrument.basePrice;
     this.device = device;
     const context = canvas.getContext("webgpu");
     if (!context) throw new Error("Could not create a WebGPU canvas context.");
@@ -255,6 +259,7 @@ export class HeatmapRenderer {
   setInstrument(instrument: Instrument): void {
     this.instrument = instrument;
     this.midPrice = instrument.basePrice;
+    this.anchorPrice = instrument.basePrice;
     this.historyCount = 0;
     this.historyHead = 0;
     this.midPrices.fill(0);
@@ -296,6 +301,7 @@ export class HeatmapRenderer {
 
   uploadUpdate(frame: UpdateFrame): void {
     this.midPrice = frame.midPrice;
+    this.anchorPrice = frame.anchorPrice;
     this.liveLiquidity.set(frame.liquidity);
     const packed = packColumn(frame.liquidity);
     this.device.queue.writeTexture(
@@ -320,7 +326,7 @@ export class HeatmapRenderer {
     const levels: BookLevel[] = [];
     const half = Math.floor(levelCount / 2);
     const currentRow = Math.round(
-      DEPTH_ROWS / 2 - (this.midPrice - this.instrument.basePrice) / this.instrument.tickSize,
+      DEPTH_ROWS / 2 - (this.midPrice - this.anchorPrice) / this.instrument.tickSize,
     );
     for (let displayOffset = half; displayOffset >= -half; displayOffset -= 1) {
       const price = this.midPrice + displayOffset * this.instrument.tickSize;
@@ -390,7 +396,7 @@ export class HeatmapRenderer {
       this.view.priceZoom,
       visibleRows,
       this.midPrice,
-      this.instrument.basePrice,
+      this.anchorPrice,
       this.instrument.tickSize,
       DEPTH_ROWS,
       this.historyCount,
