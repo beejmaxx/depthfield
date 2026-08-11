@@ -1,5 +1,6 @@
 /target
 /dist
+/.netlify
 /web/dist
 /web/node_modules
 *.log
